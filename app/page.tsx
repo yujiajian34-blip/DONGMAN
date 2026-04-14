@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useMemo, useState } from "react";
 import { CharacterLibrary } from "@/components/CharacterLibrary";
@@ -10,6 +10,8 @@ import {
   type WorkbenchCandidate,
 } from "@/components/ReplacerWorkbench";
 import { useCharacterStore } from "@/hooks/useCharacterStore";
+import JSZip from "jszip";
+import { saveAs } from "file-saver";
 
 type ApiCandidate = {
   imageBase64: string;
@@ -168,6 +170,7 @@ async function requestReplaceCandidates(
   sourceImageBase64: string,
   targetCharacterBase64: string,
   roi: RoiRect | null,
+  extraPrompt: string,
 ): Promise<WorkbenchCandidate[]> {
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
@@ -175,18 +178,30 @@ async function requestReplaceCandidates(
     const controller = new AbortController();
     timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
+    const normalizedExtraPrompt = extraPrompt.trim();
+    const requestBody: {
+      sourceImageBase64: string;
+      targetCharacterBase64: string;
+      candidateCount: number;
+      enableRefinement: boolean;
+      extraPrompt?: string;
+    } = {
+      sourceImageBase64,
+      targetCharacterBase64,
+      candidateCount: 1,
+      enableRefinement: false,
+    };
+    if (normalizedExtraPrompt) {
+      requestBody.extraPrompt = normalizedExtraPrompt;
+    }
+
     const response = await fetch("/api/replace", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       signal: controller.signal,
-      body: JSON.stringify({
-        sourceImageBase64,
-        targetCharacterBase64,
-        candidateCount: 1,
-        enableRefinement: false,
-      }),
+      body: JSON.stringify(requestBody),
     });
 
     const payload = (await response.json()) as ReplaceResponse;
@@ -251,6 +266,30 @@ async function requestReplaceCandidates(
   }
 }
 
+
+async function downloadResultsAsZip(sourceItems: SourceBatchItem[], zipFilename: string): Promise<void> {
+  const zip = new JSZip();
+  const completedItems = sourceItems.filter(item => item.status === "done" && item.resultImageBase64);
+  
+  if (completedItems.length === 0) {
+    throw new Error("No completed images to download.");
+  }
+
+  for (const [index, item] of completedItems.entries()) {
+    const base64Data = item.resultImageBase64!.replace(/^data:image\/[a-z]+;base64,/, "");
+    const binaryData = atob(base64Data);
+    const byteArray = new Uint8Array(binaryData.length);
+    for (let i = 0; i < binaryData.length; i++) {
+      byteArray[i] = binaryData.charCodeAt(i);
+    }
+    const safeName = item.name.replace(/[^a-z0-9\-_.]/gi, "_").slice(0, 50);
+    zip.file(`${String(index + 1).padStart(3, "0")}_${safeName}.png`, byteArray, { binary: true });
+  }
+
+  const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+  saveAs(blob, zipFilename);
+}
+
 export default function HomePage() {
   const { addCharacter, removeCharacter, getCharacters, storageWarning } = useCharacterStore();
   const characters = getCharacters();
@@ -280,14 +319,15 @@ export default function HomePage() {
         name: item.name,
         sourceImageBase64: item.sourceImageBase64,
         resultImageBase64: item.resultImageBase64,
+        extraPrompt: item.extraPrompt,
         status: item.status,
         error: item.error,
       })),
     [sourceItems],
   );
 
-  const handleAddCharacter = (name: string, imageBase64: string) => {
-    const character = addCharacter(name, imageBase64);
+  const handleAddCharacter = async (name: string, imageBase64: string) => {
+    const character = await addCharacter(name, imageBase64);
     setSelectedCharacterId(character.id);
   };
 
@@ -308,6 +348,7 @@ export default function HomePage() {
       name: image.name,
       sourceImageBase64: image.imageBase64,
       resultImageBase64: null,
+      extraPrompt: "",
       status: "pending",
       error: null,
       candidates: [],
@@ -362,6 +403,23 @@ export default function HomePage() {
     );
   };
 
+  const handleSelectedSourcePromptChange = (value: string) => {
+    if (!selectedSourceId || isReplacing) {
+      return;
+    }
+
+    setSourceItems((prev) =>
+      prev.map((item) =>
+        item.id === selectedSourceId
+          ? {
+              ...item,
+              extraPrompt: value,
+            }
+          : item,
+      ),
+    );
+  };
+
   const handleExecuteReplace = async () => {
     if (sourceItems.length === 0) {
       setError("Please upload at least one source image.");
@@ -376,6 +434,7 @@ export default function HomePage() {
     const queue = sourceItems.map((item) => ({
       id: item.id,
       sourceImageBase64: item.sourceImageBase64,
+      extraPrompt: item.extraPrompt,
     }));
     const targetCharacterBase64 = selectedCharacter.imageBase64;
     const activeRoi = roi;
@@ -403,17 +462,40 @@ export default function HomePage() {
                   ...item,
                   status: "processing",
                   error: null,
+                  candidates: [],
+                  selectedCandidateIndex: 0,
+                  resultImageBase64: null,
                 }
               : item,
           ),
         );
 
         try {
-          const candidates = await requestReplaceCandidates(
-            current.sourceImageBase64,
-            targetCharacterBase64,
-            activeRoi,
-          );
+          let candidates: WorkbenchCandidate[] | null = null;
+          let lastError: unknown = null;
+
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+              candidates = await requestReplaceCandidates(
+                current.sourceImageBase64,
+                targetCharacterBase64,
+                activeRoi,
+                current.extraPrompt,
+              );
+              break;
+            } catch (attemptError) {
+              lastError = attemptError;
+              const message = attemptError instanceof Error ? attemptError.message : "";
+              const isTimeout = message.toLowerCase().includes("timed out");
+              if (!isTimeout) {
+                break;
+              }
+            }
+          }
+
+          if (!candidates) {
+            throw (lastError ?? new Error("Replacement request failed."));
+          }
 
           setSourceItems((prev) =>
             prev.map((item) =>
@@ -482,6 +564,7 @@ export default function HomePage() {
             selectedSourceName={selectedSource?.name ?? null}
             sourceImageBase64={selectedSource?.sourceImageBase64 ?? null}
             resultImageBase64={selectedSource?.resultImageBase64 ?? null}
+            selectedSourcePrompt={selectedSource?.extraPrompt ?? ""}
             selectedSourceError={selectedSource?.error ?? null}
             selectedCharacter={selectedCharacter}
             isReplacing={isReplacing}
@@ -496,9 +579,33 @@ export default function HomePage() {
             onExecuteReplace={handleExecuteReplace}
             onRoiChange={setRoi}
             onSelectCandidate={handleSelectCandidate}
+            onSelectedSourcePromptChange={handleSelectedSourcePromptChange}
+            extraActionsLeft={
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await downloadResultsAsZip(sourceItems, `manga-replaced-${new Date().toISOString().slice(0, 10)}.zip`);
+                  } catch (err) {
+                    setError(err instanceof Error ? err.message : "Failed to create ZIP file.");
+                  }
+                }}
+                disabled={sourceItems.every(item => item.status !== "done" || !item.resultImageBase64) || isReplacing}
+                className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+                下载 ZIP
+              </button>
+            }
           />
+
         </div>
       </div>
     </main>
   );
 }
+
+
+
+
+

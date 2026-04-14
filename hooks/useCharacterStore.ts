@@ -1,6 +1,7 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { compressBase64Image } from "@/utils/compressImage";
 
 export type Character = {
   id: string;
@@ -9,7 +10,7 @@ export type Character = {
 };
 
 type UseCharacterStoreReturn = {
-  addCharacter: (name: string, imageBase64: string) => Character;
+  addCharacter: (name: string, imageBase64: string) => Promise<Character>;
   removeCharacter: (id: string) => void;
   getCharacters: () => Character[];
   storageWarning: string | null;
@@ -117,11 +118,14 @@ export function useCharacterStore(): UseCharacterStoreReturn {
     }
   }, [characters, hydrated]);
 
-  const addCharacter = useCallback((name: string, imageBase64: string): Character => {
+  const addCharacter = useCallback(async (name: string, imageBase64: string): Promise<Character> => {
+    // Compress image to reduce localStorage usage (max 512px width, 70% JPEG quality)
+    const compressedImageBase64 = await compressBase64Image(imageBase64, 512, 0.7);
+    
     const newCharacter: Character = {
       id: makeId(),
       name: name.trim(),
-      imageBase64,
+      imageBase64: compressedImageBase64,
     };
 
     setCharacters((prev) => [newCharacter, ...prev]);
@@ -141,3 +145,4 @@ export function useCharacterStore(): UseCharacterStoreReturn {
     storageWarning,
   };
 }
+

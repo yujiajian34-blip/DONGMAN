@@ -6,6 +6,7 @@ type ReplaceRequestBody = {
   targetCharacterBase64?: string;
   candidateCount?: number;
   enableRefinement?: boolean;
+  extraPrompt?: string;
 };
 
 type NormalizedImage = {
@@ -60,25 +61,75 @@ STRICT CONSTRAINTS:
 1) Only replace the main subject in Image 1.
 2) Keep background, composition, camera angle, perspective, framing, panel layout, and object positions unchanged.
 3) Keep the exact same manga style: line weight, line quality, screentone/shading, contrast, and rendering style.
-4) Preserve all speech bubbles, text boxes, existing text content, and their positions exactly as in Image 1.
-5) Do not add new text, do not remove text, do not translate text.
+4) Preserve all speech bubbles and text boxes in the exact same positions and sizes as in Image 1.
+5) All visible text must be rewritten in natural English only. If source text is not English, translate it to concise natural English.
 6) Do not redesign the scene. If uncertain, copy Image 1 exactly and change only the main character.
 `;
 
+function sanitizeExtraPrompt(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.replace(/\r\n/g, "\n").trim();
+  if (!normalized) {
+    return null;
+  }
+
+  return normalized.slice(0, 600);
+}
+
+function buildReplacePrompt(roundIndex: number, extraPrompt: string | null): string {
+  const extraBlock = extraPrompt
+    ? `
+USER SUPPLEMENTAL CHARACTER DIRECTIVES (must NOT violate STRICT CONSTRAINTS):
+${extraPrompt}
+`
+    : "";
+
+  return `${SYSTEM_PROMPT_BASE}
+${extraBlock}
+Valid candidate index: ${roundIndex}.`;
+}
+
 function normalizeImageBase64(rawBase64: string): NormalizedImage {
   const value = rawBase64.trim();
-  const dataUrlMatch = value.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  const compact = value.replace(/\s/g, "");
 
-  if (dataUrlMatch) {
-    return {
-      mimeType: dataUrlMatch[1],
-      data: dataUrlMatch[2].replace(/\s/g, ""),
-    };
+  if (!compact) {
+    throw new Error("Image payload is empty.");
+  }
+
+  if (compact.startsWith("data:")) {
+    const commaIndex = compact.indexOf(",");
+    if (commaIndex > 5 && commaIndex < compact.length - 1) {
+      const header = compact.slice(5, commaIndex);
+      const data = compact.slice(commaIndex + 1);
+      const headerLower = header.toLowerCase();
+      const semicolonIndex = header.indexOf(";");
+      const mimeType = semicolonIndex === -1 ? header : header.slice(0, semicolonIndex);
+      const isImageMime = mimeType.startsWith("image/");
+      const isBase64DataUrl = headerLower.includes(";base64");
+
+      if (isImageMime && isBase64DataUrl) {
+        return {
+          mimeType,
+          data,
+        };
+      }
+
+      return {
+        mimeType: "image/png",
+        data,
+      };
+    }
+
+    throw new Error("Malformed data URL image payload.");
   }
 
   return {
     mimeType: "image/png",
-    data: value.replace(/\s/g, ""),
+    data: compact,
   };
 }
 
@@ -257,57 +308,104 @@ function looksLikeBase64(value: string): boolean {
   return /^[A-Za-z0-9+/]+={0,2}$/.test(value);
 }
 
+function extractBase64FromText(text: string): string | null {
+  if (!text) {
+    return null;
+  }
+
+  const dataUrlMatch = text.match(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]{200,}/);
+  if (dataUrlMatch) {
+    return dataUrlMatch[0];
+  }
+
+  const keyPatterns = [
+    /"b64_json"\s*:\s*"([A-Za-z0-9+/=]{200,})"/,
+    /"imageBase64"\s*:\s*"([A-Za-z0-9+/=]{200,})"/,
+    /"base64"\s*:\s*"([A-Za-z0-9+/=]{200,})"/,
+    /"data"\s*:\s*"([A-Za-z0-9+/=]{200,})"/,
+  ];
+
+  for (const pattern of keyPatterns) {
+    const match = text.match(pattern);
+    if (match?.[1] && looksLikeBase64(match[1])) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
 function extractBase64Image(payload: unknown): string | null {
   if (!payload) {
     return null;
   }
 
-  if (typeof payload === "string") {
-    const trimmed = payload.trim();
-    if (trimmed.startsWith("data:image/")) {
-      return trimmed;
+  const queue: unknown[] = [payload];
+  const visited = new Set<object>();
+  const priorityKeys = [
+    "b64_json",
+    "imageBase64",
+    "base64",
+    "image",
+    "inlineData",
+    "inline_data",
+    "data",
+  ];
+  const MAX_VISITED_NODES = 20000;
+
+  let visitedNodes = 0;
+
+  while (queue.length > 0) {
+    if (visitedNodes > MAX_VISITED_NODES) {
+      return null;
     }
 
-    const cleaned = trimmed.replace(/\s/g, "");
-    return looksLikeBase64(cleaned) ? cleaned : null;
-  }
+    const current = queue.shift();
+    if (current == null) {
+      continue;
+    }
 
-  if (Array.isArray(payload)) {
-    for (const item of payload) {
-      const found = extractBase64Image(item);
-      if (found) {
-        return found;
+    if (typeof current === "string") {
+      const trimmed = current.trim();
+      if (trimmed.startsWith("data:image/")) {
+        return trimmed;
       }
-    }
-    return null;
-  }
 
-  if (typeof payload === "object") {
-    const record = payload as Record<string, unknown>;
-    const priorityKeys = [
-      "b64_json",
-      "imageBase64",
-      "base64",
-      "image",
-      "inlineData",
-      "inline_data",
-      "data",
-    ];
+      const cleaned = trimmed.replace(/\s/g, "");
+      if (looksLikeBase64(cleaned)) {
+        return cleaned;
+      }
+      continue;
+    }
+
+    if (typeof current !== "object") {
+      continue;
+    }
+
+    if (visited.has(current)) {
+      continue;
+    }
+
+    visited.add(current);
+    visitedNodes += 1;
+
+    if (Array.isArray(current)) {
+      for (const item of current) {
+        queue.push(item);
+      }
+      continue;
+    }
+
+    const record = current as Record<string, unknown>;
 
     for (const key of priorityKeys) {
       if (key in record) {
-        const found = extractBase64Image(record[key]);
-        if (found) {
-          return found;
-        }
+        queue.unshift(record[key]);
       }
     }
 
     for (const value of Object.values(record)) {
-      const found = extractBase64Image(value);
-      if (found) {
-        return found;
-      }
+      queue.push(value);
     }
   }
 
@@ -324,44 +422,77 @@ async function generateOneCandidate(
   const upstreamErrors: Array<{ variant: string; status: number; statusText: string; snippet: string }> = [];
 
   for (const variant of payloadVariants) {
-    const attempt = await callGatewayWithHardTimeout(variant.payload);
-    const imageBase64 = attempt.ok ? extractBase64Image(attempt.json) : null;
-    const hasImage = Boolean(imageBase64);
+    try {
+      const attempt = await callGatewayWithHardTimeout(variant.payload);
+      let imageBase64: string | null = null;
 
-    attempts.push({
-      name: variant.name,
-      status: attempt.status,
-      ok: attempt.ok,
-      hasImage,
-    });
+      if (attempt.ok) {
+        imageBase64 = extractBase64FromText(attempt.text);
 
-    if (!attempt.ok) {
-      upstreamErrors.push({
-        variant: variant.name,
+        if (!imageBase64) {
+          try {
+            imageBase64 = extractBase64Image(attempt.json);
+          } catch (extractError) {
+            upstreamErrors.push({
+              variant: `${variant.name}:extract`,
+              status: 500,
+              statusText: "Image extraction failed",
+              snippet: extractError instanceof Error ? extractError.message.slice(0, 280) : "Unknown extraction error",
+            });
+          }
+        }
+      }
+
+      const hasImage = Boolean(imageBase64);
+
+      attempts.push({
+        name: variant.name,
         status: attempt.status,
-        statusText: attempt.statusText,
-        snippet: attempt.text.slice(0, 280),
+        ok: attempt.ok,
+        hasImage,
+      });
+
+      if (!attempt.ok) {
+        upstreamErrors.push({
+          variant: variant.name,
+          status: attempt.status,
+          statusText: attempt.statusText,
+          snippet: attempt.text.slice(0, 280),
+        });
+      }
+
+      if (!hasImage) {
+        continue;
+      }
+
+      const normalizedResult = imageBase64!.startsWith("data:image/")
+        ? imageBase64!
+        : `data:image/png;base64,${imageBase64}`;
+
+      return {
+        candidate: {
+          imageBase64: normalizedResult,
+          selectedVariant: variant.name,
+          attempts,
+          stage,
+        },
+        attempts,
+        upstreamErrors,
+      };
+    } catch (variantError) {
+      attempts.push({
+        name: variant.name,
+        status: 500,
+        ok: false,
+        hasImage: false,
+      });
+      upstreamErrors.push({
+        variant: `${variant.name}:unexpected`,
+        status: 500,
+        statusText: "Unexpected candidate generation error",
+        snippet: variantError instanceof Error ? variantError.message.slice(0, 280) : "Unknown error",
       });
     }
-
-    if (!hasImage) {
-      continue;
-    }
-
-    const normalizedResult = imageBase64!.startsWith("data:image/")
-      ? imageBase64!
-      : `data:image/png;base64,${imageBase64}`;
-
-    return {
-      candidate: {
-        imageBase64: normalizedResult,
-        selectedVariant: variant.name,
-        attempts,
-        stage,
-      },
-      attempts,
-      upstreamErrors,
-    };
   }
 
   return {
@@ -387,6 +518,7 @@ export async function POST(request: Request) {
 
     const sourceImage = normalizeImageBase64(sourceImageBase64);
     const targetImage = normalizeImageBase64(targetCharacterBase64);
+    const extraPrompt = sanitizeExtraPrompt(body.extraPrompt);
     const requestedCandidateCount = 1;
     const enableRefinement = false;
 
@@ -401,6 +533,7 @@ export async function POST(request: Request) {
         length: targetImage.data.length,
         hash16: hashBase64(targetImage.data),
       },
+      extraPromptLength: extraPrompt?.length ?? 0,
     };
 
     const candidates: GeneratedCandidate[] = [];
@@ -412,7 +545,7 @@ export async function POST(request: Request) {
     }> = [];
 
     for (let i = 0; i < requestedCandidateCount; i += 1) {
-      const prompt = `${SYSTEM_PROMPT_BASE}\nValid candidate index: ${i + 1}.`;
+      const prompt = buildReplacePrompt(i + 1, extraPrompt);
       const initialResult = await generateOneCandidate(prompt, [sourceImage, targetImage], "initial");
       const initial = initialResult.candidate;
       if (initial) {
@@ -490,6 +623,7 @@ Additional instruction:
 
     return NextResponse.json(payload, { status: 200 });
   } catch (error) {
+    console.error("[/api/replace] Internal error:", error);
     return NextResponse.json(
       {
         error: "Internal server error.",

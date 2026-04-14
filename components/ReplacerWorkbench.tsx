@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { ChangeEvent, MouseEvent, useMemo, useRef, useState } from "react";
 import { Crop, Download, Loader2, Sparkles, Trash2, X } from "lucide-react";
@@ -30,6 +30,7 @@ export type SourceQueueDisplayItem = {
   name: string;
   sourceImageBase64: string;
   resultImageBase64: string | null;
+  extraPrompt: string;
   status: "pending" | "processing" | "done" | "failed";
   error: string | null;
 };
@@ -40,6 +41,7 @@ type ReplacerWorkbenchProps = {
   selectedSourceName: string | null;
   sourceImageBase64: string | null;
   resultImageBase64: string | null;
+  selectedSourcePrompt: string;
   selectedSourceError: string | null;
   selectedCharacter: Character | null;
   isReplacing: boolean;
@@ -54,6 +56,9 @@ type ReplacerWorkbenchProps = {
   onExecuteReplace: () => void;
   onRoiChange: (roi: RoiRect | null) => void;
   onSelectCandidate: (index: number) => void;
+  onSelectedSourcePromptChange: (value: string) => void;
+  /** Optional actions to render to the left of the execute button */
+  extraActionsLeft?: React.ReactNode;
 };
 
 function clamp01(value: number): number {
@@ -125,6 +130,7 @@ export function ReplacerWorkbench({
   selectedSourceName,
   sourceImageBase64,
   resultImageBase64,
+  selectedSourcePrompt,
   selectedSourceError,
   selectedCharacter,
   isReplacing,
@@ -139,6 +145,8 @@ export function ReplacerWorkbench({
   onExecuteReplace,
   onRoiChange,
   onSelectCandidate,
+  onSelectedSourcePromptChange,
+  extraActionsLeft,
 }: ReplacerWorkbenchProps) {
   const sourceStageRef = useRef<HTMLDivElement | null>(null);
   const [isDrawingRoi, setIsDrawingRoi] = useState(false);
@@ -262,6 +270,8 @@ export function ReplacerWorkbench({
           </p>
         </div>
 
+        {extraActionsLeft}
+
         <button
           type="button"
           onClick={onExecuteReplace}
@@ -327,6 +337,12 @@ export function ReplacerWorkbench({
                   {statusLabel(item.status)}
                 </span>
 
+                {item.extraPrompt.trim() ? (
+                  <span className="rounded border border-blue-500/40 bg-blue-500/10 px-1.5 py-0.5 text-[10px] text-blue-200">
+                    Prompt
+                  </span>
+                ) : null}
+
                 <button
                   type="button"
                   onClick={() => onRemoveSource(item.id)}
@@ -370,6 +386,25 @@ export function ReplacerWorkbench({
             Clear ROI
           </button>
         ) : null}
+      </div>
+
+      <div className="mb-3 space-y-2 rounded-xl border border-zinc-800 bg-zinc-900/70 p-3">
+        <div className="flex items-center justify-between">
+          <p className="text-xs font-semibold uppercase tracking-[0.12em] text-zinc-300">Prompt For Selected Source</p>
+          <p className="text-[11px] text-zinc-500">{selectedSourcePrompt.length}/600</p>
+        </div>
+        <textarea
+          value={selectedSourcePrompt}
+          onChange={(event) => onSelectedSourcePromptChange(event.target.value.slice(0, 600))}
+          disabled={!selectedItem || isReplacing}
+          rows={3}
+          placeholder={
+            selectedItem
+              ? "Example: Keep short orange hair, tired narrow eyes, masculine jawline, plain gray shirt."
+              : "Select one source image first."
+          }
+          className="w-full resize-y rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
+        />
       </div>
 
       {error ? <p className="mb-2 rounded-lg border border-rose-500/30 bg-rose-500/10 p-2 text-xs text-rose-300">{error}</p> : null}
@@ -471,3 +506,4 @@ export function ReplacerWorkbench({
     </section>
   );
 }
+
