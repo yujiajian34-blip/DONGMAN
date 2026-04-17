@@ -2,12 +2,17 @@
   "name": "new-project",
   "version": "1.0.0",
   "private": true,
+  "main": "electron/main.cjs",
   "description": "MangaReplacer",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:web": "next build",
+    "prepare:desktop": "node scripts/prepare-electron-build.cjs",
+    "desktop:dev": "electron .",
+    "build:exe": "npm run build:web && npm run prepare:desktop && electron-builder --win portable"
   },
   "dependencies": {
     "@tailwindcss/postcss": "^4.2.2",
@@ -24,6 +29,39 @@
     "@types/node": "^25.6.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8",
     "typescript": "^6.0.2"
+  },
+  "build": {
+    "appId": "com.yujj.mangareplacer",
+    "productName": "MangaReplacer",
+    "asar": false,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      ".next/standalone/**/*",
+      ".next/static/**/*",
+      "package.json"
+    ],
+    "extraMetadata": {
+      "main": "electron/main.cjs"
+    },
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "MangaReplacer-${version}-portable.${ext}"
+    }
   }
 }

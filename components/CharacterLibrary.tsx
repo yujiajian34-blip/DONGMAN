@@ -6,10 +6,14 @@ import type { Character } from "@/hooks/useCharacterStore";
 
 type CharacterLibraryProps = {
   characters: Character[];
-  selectedCharacterId: string | null;
+  selectionMode: "single" | "multi";
+  selectedCharacterIds: string[];
   storageWarning?: string | null;
-  onSelectCharacter: (id: string) => void;
-  onAddCharacter: (name: string, imageBase64: string) => void;
+  isBusy?: boolean;
+  selectionEnabled?: boolean;
+  onSelectionModeChange: (mode: "single" | "multi") => void;
+  onToggleCharacterSelection: (id: string) => void;
+  onAddCharacter: (name: string, imageBase64: string) => Promise<void> | void;
   onRemoveCharacter: (id: string) => void;
 };
 
@@ -33,9 +37,13 @@ function fileToBase64(file: File): Promise<string> {
 
 export function CharacterLibrary({
   characters,
-  selectedCharacterId,
+  selectionMode,
+  selectedCharacterIds,
   storageWarning,
-  onSelectCharacter,
+  isBusy = false,
+  selectionEnabled = true,
+  onSelectionModeChange,
+  onToggleCharacterSelection,
   onAddCharacter,
   onRemoveCharacter,
 }: CharacterLibraryProps) {
@@ -50,6 +58,10 @@ export function CharacterLibrary({
   };
 
   const handleAddCharacter = async () => {
+    if (isBusy) {
+      return;
+    }
+
     if (!pendingFile) {
       setUploadError("Please upload a character image first.");
       return;
@@ -62,7 +74,7 @@ export function CharacterLibrary({
 
     try {
       const imageBase64 = await fileToBase64(pendingFile);
-      onAddCharacter(characterName.trim(), imageBase64);
+      await onAddCharacter(characterName.trim(), imageBase64);
 
       setCharacterName("");
       setPendingFile(null);
@@ -76,8 +88,49 @@ export function CharacterLibrary({
     <aside className="h-full rounded-2xl border border-zinc-800/90 bg-zinc-950/70 p-4 shadow-2xl shadow-black/40 backdrop-blur">
       <div className="mb-4">
         <h2 className="text-sm font-semibold uppercase tracking-[0.18em] text-zinc-300">Character Library</h2>
-        <p className="mt-1 text-xs text-zinc-500">Upload a reference portrait and keep it reusable.</p>
+        <p className="mt-1 text-xs text-zinc-500">Upload reusable reference portraits, then choose targets or assign them per person.</p>
       </div>
+
+      {selectionEnabled ? (
+        <>
+          <div className="mb-3 inline-flex w-full rounded-lg border border-zinc-800 bg-zinc-900/80 p-1">
+            <button
+              type="button"
+              onClick={() => onSelectionModeChange("single")}
+              disabled={isBusy}
+              className={`flex-1 rounded-md px-3 py-2 text-xs font-medium transition ${
+                selectionMode === "single"
+                  ? "bg-emerald-500 text-zinc-950"
+                  : "text-zinc-300 hover:bg-zinc-800"
+              } disabled:cursor-not-allowed disabled:opacity-60`}
+            >
+              Single
+            </button>
+            <button
+              type="button"
+              onClick={() => onSelectionModeChange("multi")}
+              disabled={isBusy}
+              className={`flex-1 rounded-md px-3 py-2 text-xs font-medium transition ${
+                selectionMode === "multi"
+                  ? "bg-emerald-500 text-zinc-950"
+                  : "text-zinc-300 hover:bg-zinc-800"
+              } disabled:cursor-not-allowed disabled:opacity-60`}
+            >
+              Multi
+            </button>
+          </div>
+
+          <p className="mb-4 text-xs text-zinc-500">
+            {selectionMode === "single"
+              ? "Single mode applies one target character to the whole batch."
+              : `${selectedCharacterIds.length} target(s) selected for the current batch.`}
+          </p>
+        </>
+      ) : (
+        <p className="mb-4 rounded-lg border border-zinc-800 bg-zinc-900/70 px-3 py-2 text-xs text-zinc-500">
+          Multi-subject mapping mode is active. Add or manage characters here, then assign each person inside the workbench.
+        </p>
+      )}
 
       {storageWarning ? (
         <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-200">
@@ -91,6 +144,7 @@ export function CharacterLibrary({
           value={characterName}
           onChange={(event) => setCharacterName(event.target.value)}
           placeholder="Character name"
+          disabled={isBusy}
           className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2"
         />
 
@@ -98,13 +152,15 @@ export function CharacterLibrary({
           type="file"
           accept="image/*"
           onChange={handleFileChange}
+          disabled={isBusy}
           className="w-full cursor-pointer rounded-lg border border-dashed border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-300 file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-zinc-800 file:px-3 file:py-1.5 file:text-xs file:font-medium file:text-zinc-200 hover:file:bg-zinc-700"
         />
 
         <button
           type="button"
           onClick={handleAddCharacter}
-          className="flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-500 px-3 py-2 text-sm font-medium text-zinc-950 transition hover:bg-emerald-400"
+          disabled={isBusy}
+          className="flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-500 px-3 py-2 text-sm font-medium text-zinc-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400"
         >
           <UserRoundPlus size={16} />
           Add Character
@@ -121,21 +177,36 @@ export function CharacterLibrary({
         ) : null}
 
         {characters.map((character) => {
-          const isSelected = selectedCharacterId === character.id;
+          const isSelected = selectedCharacterIds.includes(character.id);
+          const selectionHint = !selectionEnabled
+            ? "Available for mapping"
+            : selectionMode === "multi"
+              ? isSelected
+                ? "Included in batch"
+                : "Click to include"
+              : isSelected
+                ? "Selected"
+                : "Click to select";
 
           return (
             <div
               key={character.id}
               className={`group flex items-center gap-3 rounded-xl border p-2 transition ${
-                isSelected
+                selectionEnabled && isSelected
                   ? "border-emerald-500/80 bg-emerald-500/10"
                   : "border-zinc-800 bg-zinc-900/60 hover:border-zinc-700"
               }`}
             >
               <button
                 type="button"
-                onClick={() => onSelectCharacter(character.id)}
-                className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                onClick={() => {
+                  if (!selectionEnabled) {
+                    return;
+                  }
+                  onToggleCharacterSelection(character.id);
+                }}
+                disabled={isBusy || !selectionEnabled}
+                className="flex min-w-0 flex-1 items-center gap-3 text-left disabled:cursor-default"
               >
                 <img
                   src={character.imageBase64}
@@ -144,14 +215,21 @@ export function CharacterLibrary({
                 />
                 <div className="min-w-0">
                   <p className="truncate text-sm font-medium text-zinc-100">{character.name}</p>
-                  <p className="text-xs text-zinc-500">{isSelected ? "Selected" : "Click to select"}</p>
+                  <p className="text-xs text-zinc-500">{selectionHint}</p>
                 </div>
               </button>
+
+              {selectionEnabled && isSelected ? (
+                <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-200">
+                  {selectionMode === "multi" ? "On" : "Active"}
+                </span>
+              ) : null}
 
               <button
                 type="button"
                 onClick={() => onRemoveCharacter(character.id)}
-                className="rounded-md p-1.5 text-zinc-500 transition hover:bg-rose-500/10 hover:text-rose-400"
+                disabled={isBusy}
+                className="rounded-md p-1.5 text-zinc-500 transition hover:bg-rose-500/10 hover:text-rose-400 disabled:cursor-not-allowed disabled:opacity-50"
                 aria-label={`Remove ${character.name}`}
               >
                 <Trash2 size={16} />

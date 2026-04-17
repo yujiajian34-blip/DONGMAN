@@ -1,9 +1,25 @@
 import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 
+type RoiRect = {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+};
+
+type SubjectMappingRequest = {
+  label?: string;
+  targetCharacterBase64?: string;
+  targetCharacterName?: string;
+  notes?: string;
+  roi?: RoiRect | null;
+};
+
 type ReplaceRequestBody = {
   sourceImageBase64?: string;
   targetCharacterBase64?: string;
+  subjectMappings?: SubjectMappingRequest[];
   candidateCount?: number;
   enableRefinement?: boolean;
   extraPrompt?: string;
@@ -12,6 +28,19 @@ type ReplaceRequestBody = {
 type NormalizedImage = {
   mimeType: string;
   data: string;
+};
+
+type NormalizedSubjectMapping = {
+  label: string;
+  targetCharacterName: string | null;
+  notes: string | null;
+  roi: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  referenceImage: NormalizedImage;
 };
 
 type GatewayPayloadVariant = {
@@ -47,13 +76,16 @@ type GenerateCandidateResult = {
   upstreamErrors: Array<{ variant: string; status: number; statusText: string; snippet: string }>;
 };
 
+class RequestValidationError extends Error {}
+
 const GATEWAY_URL =
   "http://aigw.primeinnos.com/marketing_center_gemini/v1/projects/gemini-flat260304-2/locations/global/publishers/google/models/gemini-3.1-flash-image-preview:generateContent";
 const GATEWAY_TOKEN = process.env.GEMINI_GATEWAY_TOKEN ?? "tk-P0L4myF72gCLmGdpa9jJpqoRvgKWDy68";
 const DEBUG_ENABLED = process.env.REPLACE_DEBUG === "1";
 const GATEWAY_TIMEOUT_MS = Number(process.env.GATEWAY_TIMEOUT_MS ?? 70000);
+const MAX_SUBJECT_MAPPINGS = 4;
 
-const SYSTEM_PROMPT_BASE = `
+const SINGLE_SUBJECT_PROMPT_BASE = `
 You are an expert manga illustrator.
 Task: edit Image 1 (Context) by replacing ONLY the main character with the character identity from Image 2 (Reference).
 
@@ -65,6 +97,34 @@ STRICT CONSTRAINTS:
 5) All visible text must be rewritten in natural English only. If source text is not English, translate it to concise natural English.
 6) Do not redesign the scene. If uncertain, copy Image 1 exactly and change only the main character.
 `;
+
+const MULTI_SUBJECT_PROMPT_BASE = `
+You are an expert manga illustrator.
+Task: edit Image 1 (Context) by replacing MULTIPLE distinct characters according to the numbered subject mappings below.
+
+STRICT CONSTRAINTS:
+1) Only edit the characters inside the listed ROIs in Image 1.
+2) Use each numbered reference image only for its matching subject mapping.
+3) Keep every other character, background element, camera angle, perspective, framing, panel layout, and object position unchanged.
+4) Keep the exact same manga style: line weight, line quality, screentone/shading, contrast, and rendering style.
+5) Preserve all speech bubbles and text boxes in the exact same positions and sizes as in Image 1.
+6) Keep each replacement character in the same pose, scale, direction, and placement as the original person inside that ROI.
+7) If uncertain, make the smallest possible local edit inside the listed ROI and leave everything else untouched.
+`;
+
+function clamp01(value: number): number {
+  if (value < 0) {
+    return 0;
+  }
+  if (value > 1) {
+    return 1;
+  }
+  return value;
+}
+
+function formatPercent(value: number): string {
+  return `${(clamp01(value) * 100).toFixed(1)}%`;
+}
 
 function sanitizeExtraPrompt(value: unknown): string | null {
   if (typeof value !== "string") {
@@ -79,7 +139,24 @@ function sanitizeExtraPrompt(value: unknown): string | null {
   return normalized.slice(0, 600);
 }
 
-function buildReplacePrompt(roundIndex: number, extraPrompt: string | null): string {
+function sanitizeShortText(value: unknown, maxLength: number): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.replace(/\r\n/g, "\n").trim();
+  if (!normalized) {
+    return null;
+  }
+
+  return normalized.slice(0, maxLength);
+}
+
+function sanitizeLabel(value: unknown, fallback: string): string {
+  return sanitizeShortText(value, 40) ?? fallback;
+}
+
+function buildSingleReplacePrompt(roundIndex: number, extraPrompt: string | null): string {
   const extraBlock = extraPrompt
     ? `
 USER SUPPLEMENTAL CHARACTER DIRECTIVES (must NOT violate STRICT CONSTRAINTS):
@@ -87,7 +164,39 @@ ${extraPrompt}
 `
     : "";
 
-  return `${SYSTEM_PROMPT_BASE}
+  return `${SINGLE_SUBJECT_PROMPT_BASE}
+${extraBlock}
+Valid candidate index: ${roundIndex}.`;
+}
+
+function buildSceneMappingPrompt(
+  roundIndex: number,
+  subjectMappings: NormalizedSubjectMapping[],
+  extraPrompt: string | null,
+): string {
+  const mappingBlock = subjectMappings
+    .map((mapping, index) => {
+      const referenceNumber = index + 2;
+      const notesBlock = mapping.notes ? ` Notes: ${mapping.notes}` : "";
+      const nameBlock = mapping.targetCharacterName ? ` (${mapping.targetCharacterName})` : "";
+
+      return `${index + 1}. Subject label: ${mapping.label}. Replace the person inside ROI x=${formatPercent(mapping.roi.x)}, y=${formatPercent(mapping.roi.y)}, width=${formatPercent(mapping.roi.width)}, height=${formatPercent(mapping.roi.height)} in Image 1 using Image ${referenceNumber}${nameBlock}.${notesBlock}`;
+    })
+    .join("\n");
+
+  const extraBlock = extraPrompt
+    ? `
+USER SUPPLEMENTAL DIRECTIVES (must NOT violate STRICT CONSTRAINTS):
+${extraPrompt}
+`
+    : "";
+
+  return `${MULTI_SUBJECT_PROMPT_BASE}
+
+ROI coordinates are normalized to Image 1, where x/y are the top-left corner and width/height are the box size.
+
+SUBJECT MAPPINGS:
+${mappingBlock}
 ${extraBlock}
 Valid candidate index: ${roundIndex}.`;
 }
@@ -97,7 +206,7 @@ function normalizeImageBase64(rawBase64: string): NormalizedImage {
   const compact = value.replace(/\s/g, "");
 
   if (!compact) {
-    throw new Error("Image payload is empty.");
+    throw new RequestValidationError("Image payload is empty.");
   }
 
   if (compact.startsWith("data:")) {
@@ -124,7 +233,7 @@ function normalizeImageBase64(rawBase64: string): NormalizedImage {
       };
     }
 
-    throw new Error("Malformed data URL image payload.");
+    throw new RequestValidationError("Malformed data URL image payload.");
   }
 
   return {
@@ -133,63 +242,96 @@ function normalizeImageBase64(rawBase64: string): NormalizedImage {
   };
 }
 
+function normalizeRoiRect(rawRoi: unknown, index: number): NormalizedSubjectMapping["roi"] {
+  if (!rawRoi || typeof rawRoi !== "object") {
+    throw new RequestValidationError(`Subject mapping ${index + 1} is missing an ROI.`);
+  }
+
+  const roi = rawRoi as RoiRect;
+  const x = Number(roi.x);
+  const y = Number(roi.y);
+  const width = Number(roi.width);
+  const height = Number(roi.height);
+
+  if (![x, y, width, height].every((value) => Number.isFinite(value))) {
+    throw new RequestValidationError(`Subject mapping ${index + 1} has an invalid ROI.`);
+  }
+
+  const normalized = {
+    x: clamp01(x),
+    y: clamp01(y),
+    width: clamp01(width),
+    height: clamp01(height),
+  };
+
+  if (normalized.width <= 0 || normalized.height <= 0) {
+    throw new RequestValidationError(`Subject mapping ${index + 1} has an empty ROI.`);
+  }
+
+  return normalized;
+}
+
+function normalizeSubjectMappings(rawMappings: unknown): NormalizedSubjectMapping[] {
+  if (!Array.isArray(rawMappings)) {
+    return [];
+  }
+
+  if (rawMappings.length === 0) {
+    return [];
+  }
+
+  if (rawMappings.length > MAX_SUBJECT_MAPPINGS) {
+    throw new RequestValidationError(`Up to ${MAX_SUBJECT_MAPPINGS} subject mappings are supported per request.`);
+  }
+
+  return rawMappings.map((rawMapping, index) => {
+    if (!rawMapping || typeof rawMapping !== "object") {
+      throw new RequestValidationError(`Subject mapping ${index + 1} is invalid.`);
+    }
+
+    const mapping = rawMapping as SubjectMappingRequest;
+    if (typeof mapping.targetCharacterBase64 !== "string" || !mapping.targetCharacterBase64.trim()) {
+      throw new RequestValidationError(`Subject mapping ${index + 1} is missing a target character reference image.`);
+    }
+
+    return {
+      label: sanitizeLabel(mapping.label, `Subject ${index + 1}`),
+      targetCharacterName: sanitizeShortText(mapping.targetCharacterName, 80),
+      notes: sanitizeShortText(mapping.notes, 240),
+      roi: normalizeRoiRect(mapping.roi, index),
+      referenceImage: normalizeImageBase64(mapping.targetCharacterBase64),
+    };
+  });
+}
+
 function hashBase64(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
 function createPayloadVariants(prompt: string, images: NormalizedImage[]): GatewayPayloadVariant[] {
-  const [sourceImage, targetImage, draftImage] = images;
-
-  if (!sourceImage || !targetImage) {
+  if (images.length < 2) {
     return [];
   }
 
   const promptPartsCamel = [
     { text: prompt },
-    {
+    ...images.map((image) => ({
       inlineData: {
-        mimeType: sourceImage.mimeType,
-        data: sourceImage.data,
+        mimeType: image.mimeType,
+        data: image.data,
       },
-    },
-    {
-      inlineData: {
-        mimeType: targetImage.mimeType,
-        data: targetImage.data,
-      },
-    },
+    })),
   ];
 
   const promptPartsSnake = [
     { text: prompt },
-    {
+    ...images.map((image) => ({
       inline_data: {
-        mime_type: sourceImage.mimeType,
-        data: sourceImage.data,
+        mime_type: image.mimeType,
+        data: image.data,
       },
-    },
-    {
-      inline_data: {
-        mime_type: targetImage.mimeType,
-        data: targetImage.data,
-      },
-    },
+    })),
   ];
-
-  if (draftImage) {
-    promptPartsCamel.push({
-      inlineData: {
-        mimeType: draftImage.mimeType,
-        data: draftImage.data,
-      },
-    });
-    promptPartsSnake.push({
-      inline_data: {
-        mime_type: draftImage.mimeType,
-        data: draftImage.data,
-      },
-    });
-  }
 
   return [
     {
@@ -505,36 +647,68 @@ async function generateOneCandidate(
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as ReplaceRequestBody;
-    const { sourceImageBase64, targetCharacterBase64 } = body;
+    const { sourceImageBase64 } = body;
 
-    if (!sourceImageBase64 || !targetCharacterBase64) {
+    if (!sourceImageBase64) {
       return NextResponse.json(
         {
-          error: "sourceImageBase64 and targetCharacterBase64 are required.",
+          error: "sourceImageBase64 is required.",
         },
         { status: 400 },
       );
     }
 
     const sourceImage = normalizeImageBase64(sourceImageBase64);
-    const targetImage = normalizeImageBase64(targetCharacterBase64);
     const extraPrompt = sanitizeExtraPrompt(body.extraPrompt);
     const requestedCandidateCount = 1;
     const enableRefinement = false;
+    const subjectMappings = normalizeSubjectMappings(body.subjectMappings);
+    const isSceneMappingMode = subjectMappings.length > 0;
 
-    const inputDebug = {
-      source: {
-        mimeType: sourceImage.mimeType,
-        length: sourceImage.data.length,
-        hash16: hashBase64(sourceImage.data),
-      },
-      target: {
-        mimeType: targetImage.mimeType,
-        length: targetImage.data.length,
-        hash16: hashBase64(targetImage.data),
-      },
-      extraPromptLength: extraPrompt?.length ?? 0,
-    };
+    if (!isSceneMappingMode && !body.targetCharacterBase64) {
+      return NextResponse.json(
+        {
+          error: "targetCharacterBase64 is required when subjectMappings are not provided.",
+        },
+        { status: 400 },
+      );
+    }
+
+    const targetImage = !isSceneMappingMode ? normalizeImageBase64(body.targetCharacterBase64 as string) : null;
+
+    const inputDebug = isSceneMappingMode
+      ? {
+          source: {
+            mimeType: sourceImage.mimeType,
+            length: sourceImage.data.length,
+            hash16: hashBase64(sourceImage.data),
+          },
+          subjectMappings: subjectMappings.map((mapping, index) => ({
+            index: index + 1,
+            label: mapping.label,
+            targetCharacterName: mapping.targetCharacterName,
+            roi: mapping.roi,
+            reference: {
+              mimeType: mapping.referenceImage.mimeType,
+              length: mapping.referenceImage.data.length,
+              hash16: hashBase64(mapping.referenceImage.data),
+            },
+          })),
+          extraPromptLength: extraPrompt?.length ?? 0,
+        }
+      : {
+          source: {
+            mimeType: sourceImage.mimeType,
+            length: sourceImage.data.length,
+            hash16: hashBase64(sourceImage.data),
+          },
+          target: {
+            mimeType: (targetImage as NormalizedImage).mimeType,
+            length: (targetImage as NormalizedImage).data.length,
+            hash16: hashBase64((targetImage as NormalizedImage).data),
+          },
+          extraPromptLength: extraPrompt?.length ?? 0,
+        };
 
     const candidates: GeneratedCandidate[] = [];
     const failedRounds: Array<{
@@ -545,16 +719,23 @@ export async function POST(request: Request) {
     }> = [];
 
     for (let i = 0; i < requestedCandidateCount; i += 1) {
-      const prompt = buildReplacePrompt(i + 1, extraPrompt);
-      const initialResult = await generateOneCandidate(prompt, [sourceImage, targetImage], "initial");
+      const prompt = isSceneMappingMode
+        ? buildSceneMappingPrompt(i + 1, subjectMappings, extraPrompt)
+        : buildSingleReplacePrompt(i + 1, extraPrompt);
+      const promptImages = isSceneMappingMode
+        ? [sourceImage, ...subjectMappings.map((mapping) => mapping.referenceImage)]
+        : [sourceImage, targetImage as NormalizedImage];
+
+      const initialResult = await generateOneCandidate(prompt, promptImages, "initial");
       const initial = initialResult.candidate;
+
       if (initial) {
         candidates.push(initial);
 
-        if (enableRefinement) {
+        if (enableRefinement && !isSceneMappingMode) {
           const draftAsImage = normalizeImageBase64(initial.imageBase64);
           const refinePrompt = `
-${SYSTEM_PROMPT_BASE}
+${SINGLE_SUBJECT_PROMPT_BASE}
 Additional instruction:
 - Image 3 is a draft output.
 - Correct Image 3 so that all background, composition, and text placement match Image 1 as closely as possible.
@@ -562,7 +743,7 @@ Additional instruction:
 `;
           const refinedResult = await generateOneCandidate(
             refinePrompt,
-            [sourceImage, targetImage, draftAsImage],
+            [sourceImage, targetImage as NormalizedImage, draftAsImage],
             "refined",
           );
           const refined = refinedResult.candidate;
@@ -613,6 +794,7 @@ Additional instruction:
         },
       })),
       meta: {
+        mode: isSceneMappingMode ? "scene-mapping" : "single-target",
         requestedCandidateCount,
         enableRefinement,
         generatedCandidateCount: candidates.length,
@@ -623,6 +805,15 @@ Additional instruction:
 
     return NextResponse.json(payload, { status: 200 });
   } catch (error) {
+    if (error instanceof RequestValidationError) {
+      return NextResponse.json(
+        {
+          error: error.message,
+        },
+        { status: 400 },
+      );
+    }
+
     console.error("[/api/replace] Internal error:", error);
     return NextResponse.json(
       {
