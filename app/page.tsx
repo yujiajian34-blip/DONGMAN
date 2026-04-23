@@ -10,14 +10,18 @@ import {
   type RoiRect,
   type SceneMappingDraft,
   type SourceQueueDisplayItem,
+  type StoryComicDraft,
+  type StoryOutputMode,
+  type StoryPlanDraft,
+  type StoryPlanStatus,
+  type StoryRoleDraft,
+  type StorySceneDraft,
   type TargetPreviewOption,
   type TargetReplacementStatus,
   type UploadedSourceImage,
   type WorkbenchCandidate,
 } from "@/components/ReplacerWorkbench";
 import { useCharacterStore, type Character } from "@/hooks/useCharacterStore";
-import JSZip from "jszip";
-import { saveAs } from "file-saver";
 
 type ApiCandidate = {
   imageBase64: string;
@@ -32,6 +36,24 @@ type ReplaceResponse = {
   candidates?: ApiCandidate[];
   error?: string;
   details?: unknown;
+};
+
+type ReplaceFailureAttempt = {
+  status?: number;
+};
+
+type ReplaceFailureUpstreamError = {
+  status?: number;
+};
+
+type ReplaceFailureRound = {
+  attempts?: ReplaceFailureAttempt[];
+  upstreamErrors?: ReplaceFailureUpstreamError[];
+};
+
+type ReplaceFailureDetails = {
+  message?: string;
+  failedRounds?: ReplaceFailureRound[];
 };
 
 type CharacterSelectionMode = "single" | "multi";
@@ -99,8 +121,85 @@ type SourceBatchItem = {
   sceneResult: SceneReplaceResult;
 };
 
-const REQUEST_TIMEOUT_MS = 90000;
-const DEFAULT_SCORE_ROI: RoiRect = { x: 0.22, y: 0.1, width: 0.56, height: 0.82 };
+type StoryPlanApiRole = {
+  label?: string;
+  description?: string;
+};
+
+type StoryPlanApiScene = {
+  title?: string;
+  narration?: string;
+  imagePrompt?: string;
+};
+
+type StoryPlanResponse = {
+  title?: string;
+  synopsis?: string;
+  visualStyle?: string;
+  storyRoles?: StoryPlanApiRole[];
+  scenes?: StoryPlanApiScene[];
+  error?: string;
+  details?: unknown;
+};
+
+type StoryPlanRequestPayload = {
+  sourceImages: Array<{
+    name: string;
+    imageBase64: string;
+  }>;
+  storyDirection?: string;
+};
+
+type CharacterAppearanceResponse = {
+  appearance?: string;
+  error?: string;
+  details?: unknown;
+};
+
+type CharacterAppearanceRequestPayload = {
+  characterName: string;
+  imageBase64: string;
+};
+
+type StorySceneRequestPayload = {
+  storyTitle: string;
+  synopsis: string;
+  visualStyle: string;
+  sceneTitle: string;
+  sceneNarration: string;
+  scenePrompt: string;
+  storyDirection?: string;
+  storyRoles: StoryRoleDraft[];
+};
+
+type StoryComicScenePayload = {
+  title: string;
+  narration: string;
+  imagePrompt: string;
+};
+
+type StoryComicRequestPayload = {
+  storyTitle: string;
+  synopsis: string;
+  visualStyle: string;
+  storyDirection?: string;
+  storyRoles: StoryRoleDraft[];
+  scenes: StoryComicScenePayload[];
+  panelCount: number;
+  pageCapacity: number;
+};
+
+// The server may try multiple upstream payload variants before responding.
+// Keep the client timeout comfortably above that path so we don't abort
+// requests that are still progressing on the server.
+const REQUEST_TIMEOUT_MS = 360000;
+class ReplaceRequestTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReplaceRequestTimeoutError";
+    Object.setPrototypeOf(this, ReplaceRequestTimeoutError.prototype);
+  }
+}
 
 function clamp01(value: number): number {
   if (value < 0) {
@@ -122,6 +221,106 @@ function makeId(): string {
 
 function normalizeImageDataUrl(value: string): string {
   return value.startsWith("data:image/") ? value : `data:image/png;base64,${value}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function clampText(value: unknown, maxLength: number, fallback: string): string {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+
+  const normalized = value.replace(/\r\n/g, "\n").trim();
+  return normalized ? normalized.slice(0, maxLength) : fallback;
+}
+
+function getFailureStatuses(details: unknown): number[] {
+  if (!isRecord(details) || !Array.isArray(details.failedRounds)) {
+    return [];
+  }
+
+  const statuses: number[] = [];
+
+  for (const round of details.failedRounds as ReplaceFailureRound[]) {
+    if (Array.isArray(round.upstreamErrors)) {
+      for (const upstreamError of round.upstreamErrors) {
+        const status = Number(upstreamError?.status);
+        if (Number.isFinite(status)) {
+          statuses.push(status);
+        }
+      }
+    }
+
+    if (Array.isArray(round.attempts)) {
+      for (const attempt of round.attempts) {
+        const status = Number(attempt?.status);
+        if (Number.isFinite(status)) {
+          statuses.push(status);
+        }
+      }
+    }
+  }
+
+  return statuses;
+}
+
+function buildReplaceFailureMessage(response: Response, payload: ReplaceResponse): string {
+  const baseMessage = payload.error ?? "Replacement request failed.";
+
+  if (typeof payload.details === "string") {
+    return [baseMessage, payload.details].filter(Boolean).join(" ");
+  }
+
+  const details = isRecord(payload.details) ? (payload.details as ReplaceFailureDetails) : null;
+  const detailMessage = typeof details?.message === "string" ? details.message : null;
+  const failureStatuses = getFailureStatuses(payload.details);
+
+  if (failureStatuses.length > 0) {
+    if (failureStatuses.some((status) => status === 401 || status === 403)) {
+      return "Gateway authentication failed. Check the configured token and retry.";
+    }
+
+    if (failureStatuses.some((status) => status === 429)) {
+      return "Gateway is rate limited right now. Wait a moment and retry.";
+    }
+
+    if (failureStatuses.every((status) => status === 408)) {
+      return "Gateway timed out before it returned an image. Try again, reduce image size, or reduce mapped subjects.";
+    }
+  }
+
+  if (response.status >= 500 && detailMessage) {
+    return `${baseMessage} ${detailMessage}`;
+  }
+
+  return detailMessage ? `${baseMessage} ${detailMessage}` : baseMessage;
+}
+
+function buildApiFailureMessage(response: Response, payload: { error?: string; details?: unknown }, fallback: string): string {
+  const baseMessage = payload.error ?? fallback;
+
+  if (typeof payload.details === "string") {
+    return [baseMessage, payload.details].filter(Boolean).join(" ");
+  }
+
+  const details = isRecord(payload.details) ? payload.details : null;
+  const detailMessage = typeof details?.message === "string" ? details.message : null;
+
+  if (response.status === 401 || response.status === 403) {
+    return "Gateway authentication failed. Check the configured token and retry.";
+  }
+
+  if (response.status === 429) {
+    return "Gateway is rate limited right now. Wait a moment and retry.";
+  }
+
+  if (response.status === 408) {
+    return "Gateway timed out before it returned a complete response. Try again in a moment.";
+  }
+
+  return detailMessage ? `${baseMessage} ${detailMessage}` : baseMessage;
 }
 
 function getCharacterById(
@@ -164,11 +363,11 @@ function computeAverageSaturation(data: Uint8ClampedArray): number {
 
 function normalizeScoreRois(scoreRois: ScoreRoiInput): RoiRect[] {
   if (!scoreRois) {
-    return [DEFAULT_SCORE_ROI];
+    return [];
   }
 
   if (Array.isArray(scoreRois)) {
-    return scoreRois.length > 0 ? scoreRois : [DEFAULT_SCORE_ROI];
+    return scoreRois;
   }
 
   return [scoreRois];
@@ -294,6 +493,112 @@ function createSceneMappingSlot(index: number, preferredTargetCharacterId: strin
     roi: null,
     notes: "",
   };
+}
+
+function createStoryScene(
+  index: number,
+  scene: Partial<Pick<StorySceneDraft, "title" | "narration" | "imagePrompt">> = {},
+): StorySceneDraft {
+  return {
+    id: makeId(),
+    title: scene.title?.trim() || `Scene ${index}`,
+    narration: scene.narration?.trim() || "A key beat in the generated story.",
+    imagePrompt: scene.imagePrompt?.trim() || "Generate a cinematic story illustration based on this scene.",
+    status: "pending",
+    error: null,
+    candidates: [],
+    selectedCandidateIndex: 0,
+    resultImageBase64: null,
+  };
+}
+
+function createStoryComicDraft(
+  pageIndex: number,
+  panelCount: number,
+  sceneStartIndex: number,
+  sceneEndIndex: number,
+  overrides: Partial<Pick<StoryComicDraft, "title">> = {},
+): StoryComicDraft {
+  return {
+    id: makeId(),
+    title: overrides.title?.trim() || `Comic Page ${pageIndex} (${panelCount} Panels)`,
+    pageIndex,
+    panelCount,
+    sceneStartIndex,
+    sceneEndIndex,
+    status: "pending",
+    error: null,
+    candidates: [],
+    selectedCandidateIndex: 0,
+    resultImageBase64: null,
+  };
+}
+
+function getComicPanelCount(storyOutputMode: StoryOutputMode): number {
+  return storyOutputMode === "comic-grid-4" ? 4 : 9;
+}
+
+function paginateSceneIndices(totalScenes: number, panelCapacity: number): Array<{
+  pageIndex: number;
+  panelCount: number;
+  sceneStartIndex: number;
+  sceneEndIndex: number;
+}> {
+  if (totalScenes <= 0) {
+    return [];
+  }
+
+  const pageCount = Math.ceil(totalScenes / panelCapacity);
+  const basePageSize = Math.floor(totalScenes / pageCount);
+  const remainder = totalScenes % pageCount;
+  const pages: Array<{
+    pageIndex: number;
+    panelCount: number;
+    sceneStartIndex: number;
+    sceneEndIndex: number;
+  }> = [];
+
+  let cursor = 0;
+  for (let index = 0; index < pageCount; index += 1) {
+    const panelCount = basePageSize + (index < remainder ? 1 : 0);
+    pages.push({
+      pageIndex: index + 1,
+      panelCount,
+      sceneStartIndex: cursor,
+      sceneEndIndex: cursor + panelCount - 1,
+    });
+    cursor += panelCount;
+  }
+
+  return pages;
+}
+
+function buildStoryComicPages(scenes: StorySceneDraft[], storyOutputMode: StoryOutputMode): StoryComicDraft[] {
+  const panelCapacity = getComicPanelCount(storyOutputMode);
+  const pageSpecs = paginateSceneIndices(scenes.length, panelCapacity);
+
+  return pageSpecs.map((pageSpec) =>
+    createStoryComicDraft(
+      pageSpec.pageIndex,
+      pageSpec.panelCount,
+      pageSpec.sceneStartIndex,
+      pageSpec.sceneEndIndex,
+      {
+        title: `Comic Page ${pageSpec.pageIndex} (${pageSpec.panelCount} Panels)`,
+      },
+    ),
+  );
+}
+
+function resetStoryComicPages(comicPages: StoryComicDraft[]): StoryComicDraft[] {
+  return comicPages.map((comicPage) => ({
+    ...comicPage,
+    status: "pending",
+    error: null,
+    candidates: [],
+    selectedCandidateIndex: 0,
+    resultImageBase64: null,
+  }));
 }
 
 function getRelevantTargetCharacters(
@@ -493,6 +798,98 @@ function summarizeSceneSourceStatus(
   };
 }
 
+function summarizeStoryBatchStatus(
+  storyPlan: StoryPlanDraft | null,
+  storyOutputMode: StoryOutputMode,
+  isReplacing: boolean,
+): { status: ReplacementStatus; detailText?: string } {
+  if (!storyPlan) {
+    return {
+      status: isReplacing ? "processing" : "pending",
+      detailText: "Story reference image",
+    };
+  }
+
+  if (storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9") {
+    const panelCount = getComicPanelCount(storyOutputMode);
+    const totalComicPages = storyPlan.comicPages.length;
+    const doneComicPages = storyPlan.comicPages.filter(
+      (comicPage) => comicPage.status === "done" && comicPage.resultImageBase64,
+    ).length;
+    const failedComicPages = storyPlan.comicPages.filter((comicPage) => comicPage.status === "failed").length;
+    const processingComicPages = storyPlan.comicPages.filter((comicPage) => comicPage.status === "processing").length;
+
+    let status: ReplacementStatus = "pending";
+    if (processingComicPages > 0 || isReplacing) {
+      status = "processing";
+    } else if (totalComicPages > 0 && doneComicPages === totalComicPages) {
+      status = "done";
+    } else if (failedComicPages === totalComicPages && totalComicPages > 0) {
+      status = "failed";
+    } else if (doneComicPages > 0 || failedComicPages > 0) {
+      status = "partial";
+    }
+
+    return {
+      status,
+      detailText:
+        storyPlan.scenes.length >= panelCount
+          ? `${totalComicPages} comic page${totalComicPages === 1 ? "" : "s"} planned`
+          : `Need at least ${panelCount} scenes for the comic page`,
+    };
+  }
+
+  const totalScenes = storyPlan.scenes.length;
+  const doneScenes = storyPlan.scenes.filter((scene) => scene.status === "done" && scene.resultImageBase64).length;
+  const failedScenes = storyPlan.scenes.filter((scene) => scene.status === "failed").length;
+  const processingScenes = storyPlan.scenes.filter((scene) => scene.status === "processing").length;
+
+  let status: ReplacementStatus = "pending";
+  if (processingScenes > 0 || isReplacing) {
+    status = "processing";
+  } else if (totalScenes > 0 && doneScenes === totalScenes) {
+    status = "done";
+  } else if (doneScenes > 0 || failedScenes > 0) {
+    status = "partial";
+  }
+
+  const detailText =
+    totalScenes > 0
+      ? `${totalScenes} scenes drafted${doneScenes > 0 ? `, ${doneScenes} rendered` : ""}`
+      : "Story reference image";
+
+  return { status, detailText };
+}
+
+function buildSceneMappingRequestMappings(
+  item: SourceBatchItem,
+  characterMap: Map<string, Character>,
+): SceneMappingRequestPayload[] | null {
+  if (item.sceneMappings.length === 0) {
+    return null;
+  }
+
+  const requestMappings: SceneMappingRequestPayload[] = [];
+
+  for (const mapping of item.sceneMappings) {
+    const targetCharacter = getCharacterById(characterMap, mapping.targetCharacterId);
+
+    if (!mapping.roi || !targetCharacter) {
+      return null;
+    }
+
+    requestMappings.push({
+      label: mapping.label.trim() || "Subject",
+      roi: mapping.roi,
+      targetCharacterBase64: targetCharacter.imageBase64,
+      targetCharacterName: targetCharacter.name,
+      ...(mapping.notes.trim() ? { notes: mapping.notes.trim() } : {}),
+    });
+  }
+
+  return requestMappings;
+}
+
 function createSourceBatchItem(image: UploadedSourceImage, targets: Character[]): SourceBatchItem {
   return syncSourceItemTargets(
     {
@@ -512,15 +909,13 @@ function createSourceBatchItem(image: UploadedSourceImage, targets: Character[])
 
 async function parseReplaceResponse(
   response: Response,
-  sourceImageBase64: string,
+  sourceImageBase64: string | null,
   scoreRois: ScoreRoiInput,
 ): Promise<WorkbenchCandidate[]> {
   const payload = (await response.json()) as ReplaceResponse;
 
   if (!response.ok) {
-    const detailsText =
-      typeof payload.details === "string" ? payload.details : payload.details ? JSON.stringify(payload.details) : null;
-    throw new Error([payload.error ?? "Replacement request failed.", detailsText].filter(Boolean).join(" "));
+    throw new Error(buildReplaceFailureMessage(response, payload));
   }
 
   const apiCandidates: ApiCandidate[] =
@@ -547,6 +942,10 @@ async function parseReplaceResponse(
     return normalizedCandidates;
   }
 
+  if (!sourceImageBase64) {
+    return normalizedCandidates;
+  }
+
   const scoredCandidates = await Promise.all(
     normalizedCandidates.map(async (candidate) => {
       try {
@@ -565,8 +964,10 @@ async function parseReplaceResponse(
   return scoredCandidates;
 }
 
-async function requestReplaceCandidates(
-  payload: ReplaceRequestPayload,
+async function requestApiCandidates(
+  endpoint: string,
+  payload: Record<string, unknown>,
+  sourceImageBase64: string | null,
   scoreRois: ScoreRoiInput,
 ): Promise<WorkbenchCandidate[]> {
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -575,7 +976,7 @@ async function requestReplaceCandidates(
     const controller = new AbortController();
     timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-    const response = await fetch("/api/replace", {
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -584,11 +985,169 @@ async function requestReplaceCandidates(
       body: JSON.stringify(payload),
     });
 
-    return await parseReplaceResponse(response, payload.sourceImageBase64, scoreRois);
+    return await parseReplaceResponse(response, sourceImageBase64, scoreRois);
   } catch (requestError) {
     if (requestError instanceof DOMException && requestError.name === "AbortError") {
-      throw new Error(
+      throw new ReplaceRequestTimeoutError(
         `Replace request timed out (${Math.floor(REQUEST_TIMEOUT_MS / 1000)}s). The gateway may be slow or unavailable.`,
+      );
+    }
+    throw requestError;
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+async function requestReplaceCandidates(
+  payload: ReplaceRequestPayload,
+  scoreRois: ScoreRoiInput,
+): Promise<WorkbenchCandidate[]> {
+  return requestApiCandidates("/api/replace", payload, payload.sourceImageBase64, scoreRois);
+}
+
+async function requestStorySceneCandidates(payload: StorySceneRequestPayload): Promise<WorkbenchCandidate[]> {
+  return requestApiCandidates("/api/story-scene", payload, null, null);
+}
+
+async function requestStoryComicCandidates(payload: StoryComicRequestPayload): Promise<WorkbenchCandidate[]> {
+  return requestApiCandidates("/api/story-comic", payload, null, null);
+}
+
+async function requestCharacterAppearance(payload: CharacterAppearanceRequestPayload): Promise<string> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    const controller = new AbortController();
+    timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    const response = await fetch("/api/character-appearance", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify(payload),
+    });
+
+    const data = (await response.json()) as CharacterAppearanceResponse;
+    if (!response.ok) {
+      throw new Error(buildApiFailureMessage(response, data, "Character appearance analysis failed."));
+    }
+
+    const appearance = clampText(
+      data.appearance,
+      320,
+      `Use the exact visual identity of ${payload.characterName} from the uploaded portrait.`,
+    );
+
+    if (!appearance) {
+      throw new Error("Character appearance analysis returned no usable description.");
+    }
+
+    return appearance;
+  } catch (requestError) {
+    if (requestError instanceof DOMException && requestError.name === "AbortError") {
+      throw new ReplaceRequestTimeoutError(
+        `Character appearance analysis timed out (${Math.floor(REQUEST_TIMEOUT_MS / 1000)}s). The gateway may be slow or unavailable.`,
+      );
+    }
+
+    throw requestError;
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+async function requestStoryPlan(
+  payload: StoryPlanRequestPayload,
+  storyOutputMode: StoryOutputMode,
+): Promise<StoryPlanDraft> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    const controller = new AbortController();
+    timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    const response = await fetch("/api/story-plan", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify(payload),
+    });
+
+    const data = (await response.json()) as StoryPlanResponse;
+    if (!response.ok) {
+      throw new Error(buildApiFailureMessage(response, data, "Story analysis request failed."));
+    }
+
+    const scenes = Array.isArray(data.scenes)
+      ? data.scenes.map((scene, index) =>
+          createStoryScene(index + 1, {
+            title: clampText(scene.title, 100, `Scene ${index + 1}`),
+            narration: clampText(scene.narration, 300, "A key beat in the generated story."),
+            imagePrompt: clampText(
+              scene.imagePrompt,
+              1200,
+              "Generate a cinematic story illustration based on this scene.",
+            ),
+          }),
+        )
+      : [];
+
+    if (scenes.length === 0) {
+      throw new Error("Story analysis returned no usable scenes.");
+    }
+
+    return {
+      title: clampText(data.title, 100, "Generated Story"),
+      synopsis: clampText(
+        data.synopsis,
+        500,
+        "A generated visual story built from the uploaded original images.",
+      ),
+      visualStyle: clampText(
+        data.visualStyle,
+        260,
+        "Cinematic manga-inspired illustration with strong composition and scene continuity.",
+      ),
+      storyRoles:
+        Array.isArray(data.storyRoles) && data.storyRoles.length > 0
+          ? data.storyRoles.map((role, index) => ({
+              id: makeId(),
+              label: clampText(role.label, 60, `Role ${index + 1}`),
+              description: clampText(role.description, 160, "Important story role inferred from the original images."),
+              assignedCharacterId: null,
+              assignedCharacterName: null,
+              assignedCharacterImageBase64: null,
+              assignedCharacterAppearance: null,
+            }))
+          : [
+              {
+                id: makeId(),
+                label: "Lead Role",
+                description: "Primary recurring role inferred from the uploaded original images.",
+                assignedCharacterId: null,
+                assignedCharacterName: null,
+                assignedCharacterImageBase64: null,
+                assignedCharacterAppearance: null,
+              },
+            ],
+      scenes,
+      comicPages: buildStoryComicPages(
+        scenes,
+        storyOutputMode === "comic-grid-9" ? "comic-grid-9" : "comic-grid-4",
+      ),
+    };
+  } catch (requestError) {
+    if (requestError instanceof DOMException && requestError.name === "AbortError") {
+      throw new ReplaceRequestTimeoutError(
+        `Story analysis timed out (${Math.floor(REQUEST_TIMEOUT_MS / 1000)}s). The gateway may be slow or unavailable.`,
       );
     }
     throw requestError;
@@ -604,11 +1163,82 @@ async function downloadResultsAsZip(
   replaceMode: ReplaceMode,
   targetCount: number,
   zipFilename: string,
+  storyPlan: StoryPlanDraft | null,
+  storyOutputMode: StoryOutputMode,
 ): Promise<void> {
+  const [{ default: JSZip }, fileSaverModule] = await Promise.all([import("jszip"), import("file-saver")]);
+  const saveAs =
+    typeof fileSaverModule.saveAs === "function"
+      ? fileSaverModule.saveAs
+      : typeof (fileSaverModule.default as ((...args: unknown[]) => void) | undefined) === "function"
+        ? (fileSaverModule.default as (blob: Blob, filename: string) => void)
+        : typeof (fileSaverModule.default as { saveAs?: (blob: Blob, filename: string) => void } | undefined)?.saveAs ===
+            "function"
+          ? (fileSaverModule.default as { saveAs: (blob: Blob, filename: string) => void }).saveAs
+          : null;
+
+  if (!saveAs) {
+    throw new Error("ZIP download is unavailable because the file saver module did not expose a save function.");
+  }
   const zip = new JSZip();
   let exportIndex = 0;
 
-  if (replaceMode === "scene-mapping") {
+  if (replaceMode === "story-batch") {
+    if (!storyPlan) {
+      throw new Error("No generated story scenes to download.");
+    }
+
+    const hasDoneComicPages = storyPlan.comicPages.some(
+      (comicPage) => comicPage.status === "done" && Boolean(comicPage.resultImageBase64),
+    );
+    const hasDoneScenes = storyPlan.scenes.some((scene) => scene.status === "done" && Boolean(scene.resultImageBase64));
+    const shouldExportComicPages =
+      (storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9")
+        ? hasDoneComicPages || !hasDoneScenes
+        : hasDoneComicPages && !hasDoneScenes;
+
+    if (shouldExportComicPages) {
+      const panelCount = getComicPanelCount(storyOutputMode);
+      for (const comicPage of storyPlan.comicPages) {
+        if (comicPage.status !== "done" || !comicPage.resultImageBase64) {
+          continue;
+        }
+
+        exportIndex += 1;
+        const base64Data = comicPage.resultImageBase64.replace(/^data:image\/[a-z]+;base64,/, "");
+        const binaryData = atob(base64Data);
+        const byteArray = new Uint8Array(binaryData.length);
+        for (let i = 0; i < binaryData.length; i += 1) {
+          byteArray[i] = binaryData.charCodeAt(i);
+        }
+
+        const safeComicName =
+          comicPage.title.replace(/[^a-z0-9\-_.]/gi, "_").slice(0, 60) || `${panelCount}-panel-comic`;
+        zip.file(`${String(exportIndex).padStart(3, "0")}_${safeComicName}.png`, byteArray, {
+          binary: true,
+        });
+      }
+    } else {
+      for (const scene of storyPlan.scenes) {
+        if (scene.status !== "done" || !scene.resultImageBase64) {
+          continue;
+        }
+
+        exportIndex += 1;
+        const base64Data = scene.resultImageBase64.replace(/^data:image\/[a-z]+;base64,/, "");
+        const binaryData = atob(base64Data);
+        const byteArray = new Uint8Array(binaryData.length);
+        for (let i = 0; i < binaryData.length; i += 1) {
+          byteArray[i] = binaryData.charCodeAt(i);
+        }
+
+        const safeSceneName = scene.title.replace(/[^a-z0-9\-_.]/gi, "_").slice(0, 60) || "story-scene";
+        zip.file(`${String(exportIndex).padStart(3, "0")}_${safeSceneName}.png`, byteArray, {
+          binary: true,
+        });
+      }
+    }
+  } else if (replaceMode === "scene-mapping") {
     for (const item of sourceItems) {
       if (item.sceneResult.status !== "done" || !item.sceneResult.resultImageBase64) {
         continue;
@@ -672,12 +1302,24 @@ export default function HomePage() {
   const [selectedCharacterIds, setSelectedCharacterIds] = useState<string[]>([]);
   const [sourceItems, setSourceItems] = useState<SourceBatchItem[]>([]);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
-  const [globalRoi, setGlobalRoi] = useState<RoiRect | null>(null);
   const [isReplacing, setIsReplacing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [batchProgress, setBatchProgress] = useState<{ completed: number; total: number } | null>(null);
+  const [storyPrompt, setStoryPrompt] = useState("");
+  const [storyOutputMode, setStoryOutputMode] = useState<StoryOutputMode>("scene-frames");
+  const [storyPlan, setStoryPlan] = useState<StoryPlanDraft | null>(null);
+  const [storyPlanStatus, setStoryPlanStatus] = useState<StoryPlanStatus>("idle");
+  const [selectedStorySceneId, setSelectedStorySceneId] = useState<string | null>(null);
+  const [selectedStoryComicId, setSelectedStoryComicId] = useState<string | null>(null);
 
   const characterMap = useMemo(() => new Map(characters.map((character) => [character.id, character])), [characters]);
+
+  const invalidateStoryPlan = () => {
+    setStoryPlan(null);
+    setSelectedStorySceneId(null);
+    setSelectedStoryComicId(null);
+    setStoryPlanStatus("idle");
+  };
 
   useEffect(() => {
     setSelectedCharacterIds((prev) => {
@@ -693,6 +1335,77 @@ export default function HomePage() {
       return changed ? next : prev;
     });
   }, [characterMap]);
+
+  useEffect(() => {
+    setStoryPlan((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      let changed = false;
+      const nextRoles = prev.storyRoles.map((role) => {
+        if (!role.assignedCharacterId) {
+          return role;
+        }
+
+        const character = getCharacterById(characterMap, role.assignedCharacterId);
+        if (!character) {
+          changed = true;
+          return {
+            ...role,
+            assignedCharacterId: null,
+            assignedCharacterName: null,
+            assignedCharacterImageBase64: null,
+            assignedCharacterAppearance: null,
+          };
+        }
+
+        if (
+          role.assignedCharacterName !== character.name ||
+          role.assignedCharacterImageBase64 !== character.imageBase64
+        ) {
+          changed = true;
+          return {
+            ...role,
+            assignedCharacterName: character.name,
+            assignedCharacterImageBase64: character.imageBase64,
+            assignedCharacterAppearance: null,
+          };
+        }
+
+        return role;
+      });
+
+      return changed ? { ...prev, storyRoles: nextRoles, comicPages: resetStoryComicPages(prev.comicPages) } : prev;
+    });
+  }, [characterMap]);
+
+  useEffect(() => {
+    if (storyOutputMode === "scene-frames") {
+      return;
+    }
+
+    setStoryPlan((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        comicPages: buildStoryComicPages(prev.scenes, storyOutputMode),
+      };
+    });
+  }, [storyOutputMode]);
+
+  useEffect(() => {
+    setSelectedStoryComicId((prev) => {
+      if (!storyPlan || storyPlan.comicPages.length === 0) {
+        return null;
+      }
+
+      return storyPlan.comicPages.some((comicPage) => comicPage.id === prev) ? prev : storyPlan.comicPages[0]?.id ?? null;
+    });
+  }, [storyPlan]);
 
   const selectedCharacters = useMemo(
     () =>
@@ -758,9 +1471,43 @@ export default function HomePage() {
     [activeSceneMappingId, sceneMappings],
   );
 
+  const mappedBatchReadyCount = useMemo(
+    () => sourceItems.filter((item) => Boolean(buildSceneMappingRequestMappings(item, characterMap))).length,
+    [characterMap, sourceItems],
+  );
+
+  const selectedStoryScene = useMemo(
+    () => storyPlan?.scenes.find((scene) => scene.id === selectedStorySceneId) ?? storyPlan?.scenes[0] ?? null,
+    [selectedStorySceneId, storyPlan],
+  );
+
+  const selectedStoryComic = useMemo(
+    () => storyPlan?.comicPages.find((comicPage) => comicPage.id === selectedStoryComicId) ?? storyPlan?.comicPages[0] ?? null,
+    [selectedStoryComicId, storyPlan],
+  );
+
+  const storyRoleReadyCount = useMemo(
+    () => storyPlan?.storyRoles.filter((role) => Boolean(role.assignedCharacterId)).length ?? 0,
+    [storyPlan],
+  );
+
   const queueItems: SourceQueueDisplayItem[] = useMemo(
     () =>
       sourceItems.map((item) => {
+        if (replaceMode === "story-batch") {
+          const summary = summarizeStoryBatchStatus(storyPlan, storyOutputMode, isReplacing);
+          return {
+            id: item.id,
+            name: item.name,
+            sourceImageBase64: item.sourceImageBase64,
+            resultImageBase64: null,
+            extraPrompt: "",
+            status: summary.status,
+            error: null,
+            detailText: summary.detailText,
+          };
+        }
+
         if (replaceMode === "scene-mapping") {
           const summary = summarizeSceneSourceStatus(item, characterMap);
           return {
@@ -790,7 +1537,7 @@ export default function HomePage() {
           detailText: summary.detailText,
         };
       }),
-    [activeTargetCharacters, characterMap, replaceMode, sourceItems],
+    [activeTargetCharacters, characterMap, isReplacing, replaceMode, sourceItems, storyOutputMode, storyPlan],
   );
 
   const targetOptions = useMemo<TargetPreviewOption[]>(
@@ -821,43 +1568,80 @@ export default function HomePage() {
         }));
     }
 
-    return globalRoi
-      ? [
-          {
-            id: "global-roi",
-            label: "Target ROI",
-            roi: globalRoi,
-            isActive: true,
-          },
-        ]
-      : [];
-  }, [activeSceneMappingId, globalRoi, replaceMode, sceneMappings]);
+    return [];
+  }, [activeSceneMappingId, replaceMode, sceneMappings]);
 
   const currentResultImageBase64 =
-    replaceMode === "scene-mapping"
+    replaceMode === "story-batch"
+      ? storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9"
+        ? selectedStoryComic?.resultImageBase64 ?? null
+        : selectedStoryScene?.resultImageBase64 ?? null
+      : replaceMode === "scene-mapping"
       ? selectedSource?.sceneResult.resultImageBase64 ?? null
       : selectedTargetResult?.resultImageBase64 ?? null;
   const currentResultError =
-    replaceMode === "scene-mapping" ? selectedSource?.sceneResult.error ?? null : selectedTargetResult?.error ?? null;
+    replaceMode === "story-batch"
+      ? storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9"
+        ? selectedStoryComic?.error ?? null
+        : selectedStoryScene?.error ?? null
+      : replaceMode === "scene-mapping"
+        ? selectedSource?.sceneResult.error ?? null
+        : selectedTargetResult?.error ?? null;
   const currentCandidates =
-    replaceMode === "scene-mapping" ? selectedSource?.sceneResult.candidates ?? [] : selectedTargetResult?.candidates ?? [];
+    replaceMode === "story-batch"
+      ? storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9"
+        ? selectedStoryComic?.candidates ?? []
+        : selectedStoryScene?.candidates ?? []
+      : replaceMode === "scene-mapping"
+        ? selectedSource?.sceneResult.candidates ?? []
+        : selectedTargetResult?.candidates ?? [];
   const currentSelectedCandidateIndex =
-    replaceMode === "scene-mapping"
+    replaceMode === "story-batch"
+      ? storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9"
+        ? selectedStoryComic?.selectedCandidateIndex ?? 0
+        : selectedStoryScene?.selectedCandidateIndex ?? 0
+      : replaceMode === "scene-mapping"
       ? selectedSource?.sceneResult.selectedCandidateIndex ?? 0
       : selectedTargetResult?.selectedCandidateIndex ?? 0;
   const currentResultLabel =
-    replaceMode === "scene-mapping"
+    replaceMode === "story-batch"
+      ? storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9"
+        ? selectedStoryComic?.title ?? storyPlan?.title ?? null
+        : selectedStoryScene?.title ?? storyPlan?.title ?? null
+      : replaceMode === "scene-mapping"
       ? selectedSource
         ? "Mapped Scene"
         : null
       : targetOptions.find((target) => target.id === selectedSourceActiveTargetId)?.name ?? null;
-  const activeRoi =
-    replaceMode === "scene-mapping" ? activeSceneMapping?.roi ?? null : globalRoi;
-  const activeRoiLabel =
-    replaceMode === "scene-mapping" ? activeSceneMapping?.label ?? null : "Target ROI";
+  const activeRoi = replaceMode === "scene-mapping" ? activeSceneMapping?.roi ?? null : null;
+  const activeRoiLabel = replaceMode === "scene-mapping" ? activeSceneMapping?.label ?? null : null;
+  const hasStoryZipResults =
+    (storyPlan?.comicPages.some((comicPage) => comicPage.status === "done" && Boolean(comicPage.resultImageBase64)) ??
+      false) ||
+    (storyPlan?.scenes.some((scene) => scene.status === "done" && Boolean(scene.resultImageBase64)) ?? false);
+  const hasSceneMappingZipResults = sourceItems.some(
+    (item) => item.sceneResult.status === "done" && Boolean(item.sceneResult.resultImageBase64),
+  );
+  const hasGlobalZipResults = sourceItems.some((item) =>
+    Object.values(item.targetResults).some(
+      (targetResult) => targetResult.status === "done" && Boolean(targetResult.resultImageBase64),
+    ),
+  );
+  const canDownloadZip =
+    !isReplacing &&
+    (replaceMode === "story-batch"
+      ? hasStoryZipResults
+      : replaceMode === "scene-mapping"
+        ? hasSceneMappingZipResults
+        : hasGlobalZipResults);
 
   const handleReplaceModeChange = (mode: ReplaceMode) => {
     setReplaceMode(mode);
+    setError(null);
+  };
+
+  const handleStoryOutputModeChange = (mode: StoryOutputMode) => {
+    setStoryOutputMode(mode);
     setError(null);
   };
 
@@ -910,6 +1694,7 @@ export default function HomePage() {
 
     setSourceItems((prev) => [...newItems, ...prev]);
     setSelectedSourceId(newItems[0]?.id ?? null);
+    invalidateStoryPlan();
     setError(null);
   };
 
@@ -929,6 +1714,7 @@ export default function HomePage() {
       }
       return next;
     });
+    invalidateStoryPlan();
   };
 
   const handleActiveTargetCharacterChange = (id: string) => {
@@ -1088,11 +1874,6 @@ export default function HomePage() {
   };
 
   const handleActiveRoiChange = (nextRoi: RoiRect | null) => {
-    if (replaceMode === "global-targets") {
-      setGlobalRoi(nextRoi);
-      return;
-    }
-
     if (!selectedSourceId || !activeSceneMappingId) {
       return;
     }
@@ -1117,11 +1898,6 @@ export default function HomePage() {
   };
 
   const handleClearActiveRoi = () => {
-    if (replaceMode === "global-targets") {
-      setGlobalRoi(null);
-      return;
-    }
-
     if (!selectedSourceId || !activeSceneMappingId) {
       return;
     }
@@ -1146,6 +1922,61 @@ export default function HomePage() {
   };
 
   const handleSelectCandidate = (index: number) => {
+    if (replaceMode === "story-batch") {
+      setStoryPlan((prev) => {
+        if (!prev) {
+          return prev;
+        }
+
+        if (storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9") {
+          const activeComicPage =
+            prev.comicPages.find((comicPage) => comicPage.id === selectedStoryComicId) ?? prev.comicPages[0];
+          const selectedCandidate = activeComicPage?.candidates[index];
+          if (!selectedCandidate) {
+            return prev;
+          }
+
+          return {
+            ...prev,
+            comicPages: prev.comicPages.map((comicPage) =>
+              comicPage.id === activeComicPage.id
+                ? {
+                    ...comicPage,
+                    selectedCandidateIndex: index,
+                    resultImageBase64: selectedCandidate.imageBase64,
+                  }
+                : comicPage,
+            ),
+          };
+        }
+
+        if (!selectedStorySceneId) {
+          return prev;
+        }
+
+        return {
+          ...prev,
+          scenes: prev.scenes.map((scene) => {
+            if (scene.id !== selectedStorySceneId) {
+              return scene;
+            }
+
+            const selectedCandidate = scene.candidates[index];
+            if (!selectedCandidate) {
+              return scene;
+            }
+
+            return {
+              ...scene,
+              selectedCandidateIndex: index,
+              resultImageBase64: selectedCandidate.imageBase64,
+            };
+          }),
+        };
+      });
+      return;
+    }
+
     if (!selectedSourceId) {
       return;
     }
@@ -1223,6 +2054,504 @@ export default function HomePage() {
           : item,
       ),
     );
+  };
+
+  const handleStoryPlanTitleChange = (value: string) => {
+    setStoryPlan((prev) => (prev ? { ...prev, title: value, comicPages: resetStoryComicPages(prev.comicPages) } : prev));
+  };
+
+  const handleStoryPlanSynopsisChange = (value: string) => {
+    setStoryPlan((prev) => (prev ? { ...prev, synopsis: value, comicPages: resetStoryComicPages(prev.comicPages) } : prev));
+  };
+
+  const handleStoryPlanVisualStyleChange = (value: string) => {
+    setStoryPlan((prev) => (prev ? { ...prev, visualStyle: value, comicPages: resetStoryComicPages(prev.comicPages) } : prev));
+  };
+
+  const handleStoryRoleCharacterChange = (roleId: string, characterId: string | null) => {
+    setStoryPlan((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      const assignedCharacter = getCharacterById(characterMap, characterId);
+
+      return {
+        ...prev,
+        comicPages: resetStoryComicPages(prev.comicPages),
+        storyRoles: prev.storyRoles.map((role) =>
+          role.id === roleId
+            ? {
+                ...role,
+                assignedCharacterId: characterId,
+                assignedCharacterName: assignedCharacter?.name ?? null,
+                assignedCharacterImageBase64: assignedCharacter?.imageBase64 ?? null,
+                assignedCharacterAppearance: null,
+              }
+            : role,
+        ),
+      };
+    });
+  };
+
+  const handleSelectStoryScene = (sceneId: string) => {
+    setSelectedStorySceneId(sceneId);
+  };
+
+  const handleStorySceneTitleChange = (sceneId: string, value: string) => {
+    setStoryPlan((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        comicPages: resetStoryComicPages(prev.comicPages),
+        scenes: prev.scenes.map((scene) => (scene.id === sceneId ? { ...scene, title: value || "Scene" } : scene)),
+      };
+    });
+  };
+
+  const handleStorySceneNarrationChange = (sceneId: string, value: string) => {
+    setStoryPlan((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        comicPages: resetStoryComicPages(prev.comicPages),
+        scenes: prev.scenes.map((scene) => (scene.id === sceneId ? { ...scene, narration: value } : scene)),
+      };
+    });
+  };
+
+  const handleStoryScenePromptChange = (sceneId: string, value: string) => {
+    setStoryPlan((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        comicPages: resetStoryComicPages(prev.comicPages),
+        scenes: prev.scenes.map((scene) => (scene.id === sceneId ? { ...scene, imagePrompt: value } : scene)),
+      };
+    });
+  };
+
+  const prepareStoryPlanForGeneration = async (plan: StoryPlanDraft): Promise<StoryPlanDraft> => {
+    const rolesNeedingAppearance = plan.storyRoles.filter(
+      (role) =>
+        Boolean(role.assignedCharacterId) &&
+        Boolean(role.assignedCharacterName) &&
+        Boolean(role.assignedCharacterImageBase64) &&
+        !role.assignedCharacterAppearance,
+    );
+
+    if (rolesNeedingAppearance.length === 0) {
+      return plan;
+    }
+
+    const resolvedAppearances = await Promise.all(
+      rolesNeedingAppearance.map(async (role) => ({
+        roleId: role.id,
+        appearance: await requestCharacterAppearance({
+          characterName: role.assignedCharacterName ?? role.label,
+          imageBase64: role.assignedCharacterImageBase64 ?? "",
+        }),
+      })),
+    );
+
+    const appearanceMap = new Map(resolvedAppearances.map((entry) => [entry.roleId, entry.appearance]));
+    const preparedStoryRoles = plan.storyRoles.map((role) =>
+      appearanceMap.has(role.id)
+        ? {
+            ...role,
+            assignedCharacterAppearance: appearanceMap.get(role.id) ?? role.assignedCharacterAppearance,
+          }
+        : role,
+    );
+
+    setStoryPlan((prev) =>
+      prev
+        ? {
+            ...prev,
+            storyRoles: prev.storyRoles.map((role) =>
+              appearanceMap.has(role.id)
+                ? {
+                    ...role,
+                    assignedCharacterAppearance: appearanceMap.get(role.id) ?? role.assignedCharacterAppearance,
+                  }
+                : role,
+            ),
+          }
+        : prev,
+    );
+
+    return {
+      ...plan,
+      storyRoles: preparedStoryRoles,
+    };
+  };
+
+  const executeStoryPlanAnalysis = async () => {
+    if (sourceItems.length === 0) {
+      setError("Please upload at least one reference image before generating a story.");
+      return;
+    }
+
+    setIsReplacing(true);
+    setError(null);
+    setBatchProgress({ completed: 0, total: 1 });
+    setStoryPlanStatus("processing");
+
+    try {
+      const nextStoryPlan = await requestStoryPlan({
+        sourceImages: sourceItems.map((item) => ({
+          name: item.name,
+          imageBase64: item.sourceImageBase64,
+        })),
+        ...(storyPrompt.trim() ? { storyDirection: storyPrompt.trim() } : {}),
+      }, storyOutputMode);
+
+      setStoryPlan(nextStoryPlan);
+      setSelectedStorySceneId(nextStoryPlan.scenes[0]?.id ?? null);
+      setSelectedStoryComicId(nextStoryPlan.comicPages[0]?.id ?? null);
+      setStoryPlanStatus("ready");
+      setBatchProgress({ completed: 1, total: 1 });
+      setError(null);
+    } catch (requestError) {
+      setStoryPlanStatus("failed");
+      setError(requestError instanceof Error ? requestError.message : "Story analysis failed.");
+    } finally {
+      setIsReplacing(false);
+      setBatchProgress((prev) => (prev ? { ...prev, completed: prev.total } : null));
+    }
+  };
+
+  const executeStoryBatchGenerate = async () => {
+    if (!storyPlan || storyPlan.scenes.length === 0) {
+      setError("Analyze the uploaded original images first so the app can extract the existing story scenes.");
+      return;
+    }
+
+    if (storyPlan.storyRoles.length > 0 && storyPlan.storyRoles.some((role) => !role.assignedCharacterId)) {
+      setError("Assign one of your characters to every detected story role before rendering scenes.");
+      return;
+    }
+
+    setIsReplacing(true);
+    setError(null);
+
+    let failedCount = 0;
+    let completedCount = 0;
+    let firstFailedSceneId: string | null = null;
+
+    try {
+      const preparedStoryPlan = await prepareStoryPlanForGeneration(storyPlan);
+
+      setBatchProgress({ completed: 0, total: preparedStoryPlan.scenes.length });
+      setStoryPlanStatus("ready");
+      setStoryPlan((prev) =>
+        prev
+          ? {
+              ...prev,
+              storyRoles: preparedStoryPlan.storyRoles,
+              comicPages: resetStoryComicPages(prev.comicPages),
+              scenes: prev.scenes.map((scene) => ({
+                ...scene,
+                status: "pending",
+                error: null,
+                candidates: [],
+                selectedCandidateIndex: 0,
+                resultImageBase64: null,
+              })),
+            }
+          : prev,
+      );
+
+      for (const scene of preparedStoryPlan.scenes) {
+        setSelectedStorySceneId(scene.id);
+        setStoryPlan((prev) =>
+          prev
+            ? {
+                ...prev,
+                scenes: prev.scenes.map((currentScene) =>
+                  currentScene.id === scene.id ? { ...currentScene, status: "processing", error: null } : currentScene,
+                ),
+              }
+            : prev,
+        );
+
+        try {
+          let candidates: WorkbenchCandidate[] | null = null;
+          let lastError: unknown = null;
+
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+              candidates = await requestStorySceneCandidates({
+                storyTitle: preparedStoryPlan.title,
+                synopsis: preparedStoryPlan.synopsis,
+                visualStyle: preparedStoryPlan.visualStyle,
+                sceneTitle: scene.title,
+                sceneNarration: scene.narration,
+                scenePrompt: scene.imagePrompt,
+                storyRoles: preparedStoryPlan.storyRoles,
+                ...(storyPrompt.trim() ? { storyDirection: storyPrompt.trim() } : {}),
+              });
+              break;
+            } catch (attemptError) {
+              lastError = attemptError;
+              if (!(attemptError instanceof ReplaceRequestTimeoutError)) {
+                break;
+              }
+            }
+          }
+
+          if (!candidates) {
+            throw lastError ?? new Error("Story scene generation failed.");
+          }
+
+          setStoryPlan((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  scenes: prev.scenes.map((currentScene) =>
+                    currentScene.id === scene.id
+                      ? {
+                          ...currentScene,
+                          status: "done",
+                          error: null,
+                          candidates,
+                          selectedCandidateIndex: 0,
+                          resultImageBase64: candidates[0]?.imageBase64 ?? null,
+                        }
+                      : currentScene,
+                  ),
+                }
+              : prev,
+          );
+        } catch (requestError) {
+          failedCount += 1;
+          if (!firstFailedSceneId) {
+            firstFailedSceneId = scene.id;
+          }
+          const message =
+            requestError instanceof Error ? requestError.message : "Unexpected error while generating this story scene.";
+
+          setStoryPlan((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  scenes: prev.scenes.map((currentScene) =>
+                    currentScene.id === scene.id
+                      ? {
+                          ...currentScene,
+                          status: "failed",
+                          error: message,
+                          candidates: [],
+                          selectedCandidateIndex: 0,
+                          resultImageBase64: null,
+                        }
+                      : currentScene,
+                  ),
+                }
+              : prev,
+          );
+        }
+
+        completedCount += 1;
+        setBatchProgress({ completed: completedCount, total: preparedStoryPlan.scenes.length });
+      }
+    } finally {
+      if (firstFailedSceneId) {
+        setSelectedStorySceneId(firstFailedSceneId);
+      }
+      setIsReplacing(false);
+      setBatchProgress((prev) => (prev ? { ...prev, completed: prev.total } : null));
+    }
+
+    if (failedCount > 0) {
+      setError(`${failedCount}/${storyPlan.scenes.length} story scene(s) failed. Select a scene to view details.`);
+    } else {
+      setError(null);
+    }
+  };
+
+  const executeStoryComicGenerate = async () => {
+    if (!storyPlan || storyPlan.scenes.length === 0) {
+      setError("Analyze the uploaded original images first so the app can extract the existing story scenes.");
+      return;
+    }
+
+    const pageCapacity = getComicPanelCount(storyOutputMode);
+
+    if (storyPlan.storyRoles.length > 0 && storyPlan.storyRoles.some((role) => !role.assignedCharacterId)) {
+      setError("Assign one of your characters to every detected story role before rendering the comic pages.");
+      return;
+    }
+
+    setIsReplacing(true);
+    setError(null);
+
+    let failedCount = 0;
+    let completedCount = 0;
+
+    try {
+      const preparedStoryPlan = await prepareStoryPlanForGeneration(storyPlan);
+      const nextComicPages = buildStoryComicPages(preparedStoryPlan.scenes, storyOutputMode);
+
+      if (nextComicPages.length === 0) {
+        throw new Error("Story analysis returned no scenes that could be paginated into comic pages.");
+      }
+
+      setBatchProgress({ completed: 0, total: nextComicPages.length });
+      setStoryPlanStatus("ready");
+      setSelectedStoryComicId(nextComicPages[0]?.id ?? null);
+      setStoryPlan((prev) =>
+        prev
+          ? {
+              ...prev,
+              storyRoles: preparedStoryPlan.storyRoles,
+              comicPages: nextComicPages,
+            }
+          : prev,
+      );
+
+      for (const comicPage of nextComicPages) {
+        const panelScenes = preparedStoryPlan.scenes.slice(comicPage.sceneStartIndex, comicPage.sceneEndIndex + 1);
+
+        try {
+          setSelectedStoryComicId(comicPage.id);
+          setStoryPlan((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  comicPages: prev.comicPages.map((currentComicPage) =>
+                    currentComicPage.id === comicPage.id
+                      ? {
+                          ...currentComicPage,
+                          status: "processing",
+                          error: null,
+                        }
+                      : currentComicPage,
+                  ),
+                }
+              : prev,
+          );
+
+          let candidates: WorkbenchCandidate[] | null = null;
+          let lastError: unknown = null;
+
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+              candidates = await requestStoryComicCandidates({
+                storyTitle: preparedStoryPlan.title,
+                synopsis: preparedStoryPlan.synopsis,
+                visualStyle: preparedStoryPlan.visualStyle,
+                storyRoles: preparedStoryPlan.storyRoles,
+                scenes: panelScenes.map((scene) => ({
+                  title: scene.title,
+                  narration: scene.narration,
+                  imagePrompt: scene.imagePrompt,
+                })),
+                panelCount: comicPage.panelCount,
+                pageCapacity,
+                ...(storyPrompt.trim() ? { storyDirection: storyPrompt.trim() } : {}),
+              });
+              break;
+            } catch (attemptError) {
+              lastError = attemptError;
+              if (!(attemptError instanceof ReplaceRequestTimeoutError)) {
+                break;
+              }
+            }
+          }
+
+          if (!candidates) {
+            throw lastError ?? new Error(`${comicPage.panelCount}-panel comic generation failed.`);
+          }
+
+          setStoryPlan((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  comicPages: prev.comicPages.map((currentComicPage) =>
+                    currentComicPage.id === comicPage.id
+                      ? {
+                          ...currentComicPage,
+                          status: "done",
+                          error: null,
+                          candidates,
+                          selectedCandidateIndex: 0,
+                          resultImageBase64: candidates[0]?.imageBase64 ?? null,
+                        }
+                      : currentComicPage,
+                  ),
+                }
+              : prev,
+          );
+        } catch (requestError) {
+          failedCount += 1;
+          const message =
+            requestError instanceof Error
+              ? requestError.message
+              : `Unexpected error while generating comic page ${comicPage.pageIndex}.`;
+
+          setStoryPlan((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  comicPages: prev.comicPages.map((currentComicPage) =>
+                    currentComicPage.id === comicPage.id
+                      ? {
+                          ...currentComicPage,
+                          status: "failed",
+                          error: message,
+                          candidates: [],
+                          selectedCandidateIndex: 0,
+                          resultImageBase64: null,
+                        }
+                      : currentComicPage,
+                  ),
+                }
+              : prev,
+          );
+        }
+
+        completedCount += 1;
+        setBatchProgress({ completed: completedCount, total: nextComicPages.length });
+      }
+      setError(failedCount > 0 ? `${failedCount}/${nextComicPages.length} comic page(s) failed. Select a page to view details.` : null);
+    } catch (requestError) {
+      const message =
+        requestError instanceof Error ? requestError.message : "Unexpected error while generating the comic pages.";
+
+      setStoryPlan((prev) =>
+        prev
+          ? {
+              ...prev,
+              comicPages: prev.comicPages.map((comicPage) => ({
+                ...comicPage,
+                status: "failed",
+                error: message,
+                candidates: [],
+                selectedCandidateIndex: 0,
+                resultImageBase64: null,
+              })),
+            }
+          : prev,
+      );
+      setError(message);
+    } finally {
+      setIsReplacing(false);
+      setBatchProgress((prev) => (prev ? { ...prev, completed: prev.total } : null));
+    }
+  };
+
+  const handleSelectStoryComic = (comicPageId: string) => {
+    setSelectedStoryComicId(comicPageId);
   };
 
   const executeGlobalReplace = async () => {
@@ -1304,13 +2633,12 @@ export default function HomePage() {
                     enableRefinement: false,
                     ...(current.extraPrompt.trim() ? { extraPrompt: current.extraPrompt.trim() } : {}),
                   },
-                  globalRoi,
+                  null,
                 );
                 break;
               } catch (attemptError) {
                 lastError = attemptError;
-                const message = attemptError instanceof Error ? attemptError.message : "";
-                if (!message.toLowerCase().includes("timed out")) {
+                if (!(attemptError instanceof ReplaceRequestTimeoutError)) {
                   break;
                 }
               }
@@ -1380,127 +2708,173 @@ export default function HomePage() {
   };
 
   const executeSceneMappingReplace = async () => {
-    if (!selectedSource) {
-      setError("Please select one source image first.");
+    if (sourceItems.length === 0) {
+      setError("Please upload at least one source image.");
       return;
     }
 
-    if (selectedSource.sceneMappings.length === 0) {
-      setError("Please add at least one subject mapping for this image.");
+    const queue = sourceItems
+      .map((item) => {
+        const requestMappings = buildSceneMappingRequestMappings(item, characterMap);
+        if (!requestMappings) {
+          return null;
+        }
+
+        return {
+          id: item.id,
+          sourceImageBase64: item.sourceImageBase64,
+          extraPrompt: item.extraPrompt,
+          requestMappings,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item));
+
+    if (queue.length === 0) {
+      const hasAnyMappings = sourceItems.some((item) => item.sceneMappings.length > 0);
+      setError(
+        hasAnyMappings
+          ? "Please complete the subject mappings for at least one image before running."
+          : "Please add at least one subject mapping for at least one image.",
+      );
       return;
     }
 
-    const resolvedMappings = selectedSource.sceneMappings.map((mapping) => {
-      return {
-        mapping,
-        targetCharacter: getCharacterById(characterMap, mapping.targetCharacterId),
-      };
-    });
-
-    const incompleteMappings = resolvedMappings.filter(
-      ({ mapping, targetCharacter }) => !mapping.roi || !targetCharacter,
-    );
-
-    if (incompleteMappings.length > 0) {
-      setError("Please complete every subject mapping with both a target character and an ROI before running.");
-      return;
-    }
-
-    const requestMappings: SceneMappingRequestPayload[] = resolvedMappings.map(({ mapping, targetCharacter }) => ({
-      label: mapping.label.trim() || "Subject",
-      roi: mapping.roi as RoiRect,
-      targetCharacterBase64: targetCharacter!.imageBase64,
-      targetCharacterName: targetCharacter!.name,
-      ...(mapping.notes.trim() ? { notes: mapping.notes.trim() } : {}),
-    }));
+    const readyIds = new Set(queue.map((item) => item.id));
+    const skippedCount = sourceItems.length - queue.length;
 
     setIsReplacing(true);
     setError(null);
-    setBatchProgress({ completed: 0, total: 1 });
+    setBatchProgress({ completed: 0, total: queue.length });
     setSourceItems((prev) =>
       prev.map((item) =>
-        item.id === selectedSource.id
+        readyIds.has(item.id)
           ? {
               ...item,
-              sceneResult: createSceneResult({
-                status: "processing",
-              }),
+              sceneResult: createSceneResult(),
             }
           : item,
       ),
     );
 
+    let failedCount = 0;
+    let completedCount = 0;
+
     try {
-      let candidates: WorkbenchCandidate[] | null = null;
-      let lastError: unknown = null;
+      for (const current of queue) {
+        setSelectedSourceId(current.id);
+        setSourceItems((prev) =>
+          prev.map((item) =>
+            item.id === current.id
+              ? {
+                  ...item,
+                  sceneResult: createSceneResult({
+                    status: "processing",
+                  }),
+                }
+              : item,
+          ),
+        );
 
-      for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
-          candidates = await requestReplaceCandidates(
-            {
-              sourceImageBase64: selectedSource.sourceImageBase64,
-              subjectMappings: requestMappings,
-              candidateCount: 1,
-              enableRefinement: false,
-              ...(selectedSource.extraPrompt.trim() ? { extraPrompt: selectedSource.extraPrompt.trim() } : {}),
-            },
-            requestMappings.map((mapping) => mapping.roi),
-          );
-          break;
-        } catch (attemptError) {
-          lastError = attemptError;
-          const message = attemptError instanceof Error ? attemptError.message : "";
-          if (!message.toLowerCase().includes("timed out")) {
-            break;
+          let candidates: WorkbenchCandidate[] | null = null;
+          let lastError: unknown = null;
+
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+              candidates = await requestReplaceCandidates(
+                {
+                  sourceImageBase64: current.sourceImageBase64,
+                  subjectMappings: current.requestMappings,
+                  candidateCount: 1,
+                  enableRefinement: false,
+                  ...(current.extraPrompt.trim() ? { extraPrompt: current.extraPrompt.trim() } : {}),
+                },
+                current.requestMappings.map((mapping) => mapping.roi),
+              );
+              break;
+            } catch (attemptError) {
+              lastError = attemptError;
+              if (!(attemptError instanceof ReplaceRequestTimeoutError)) {
+                break;
+              }
+            }
           }
+
+          if (!candidates) {
+            throw lastError ?? new Error("Mapped replace request failed.");
+          }
+
+          setSourceItems((prev) =>
+            prev.map((item) =>
+              item.id === current.id
+                ? {
+                    ...item,
+                    sceneResult: createSceneResult({
+                      status: "done",
+                      candidates,
+                      selectedCandidateIndex: 0,
+                      resultImageBase64: candidates[0]?.imageBase64 ?? null,
+                    }),
+                  }
+                : item,
+            ),
+          );
+        } catch (requestError) {
+          failedCount += 1;
+          const message =
+            requestError instanceof Error ? requestError.message : "Unexpected error while replacing mapped subjects.";
+
+          setSourceItems((prev) =>
+            prev.map((item) =>
+              item.id === current.id
+                ? {
+                    ...item,
+                    sceneResult: createSceneResult({
+                      status: "failed",
+                      error: message,
+                    }),
+                  }
+                : item,
+            ),
+          );
         }
+
+        completedCount += 1;
+        setBatchProgress({ completed: completedCount, total: queue.length });
       }
-
-      if (!candidates) {
-        throw lastError ?? new Error("Mapped replace request failed.");
+      if (failedCount === 0 && skippedCount === 0) {
+        setError(null);
+      } else {
+        const parts = [];
+        if (failedCount > 0) {
+          parts.push(`${failedCount}/${queue.length} mapped replacement(s) failed.`);
+        }
+        if (skippedCount > 0) {
+          parts.push(`${skippedCount} image(s) were skipped because they did not have complete subject mappings.`);
+        }
+        parts.push("Select an image to view details.");
+        setError(parts.join(" "));
       }
-
-      setSourceItems((prev) =>
-        prev.map((item) =>
-          item.id === selectedSource.id
-            ? {
-                ...item,
-                sceneResult: createSceneResult({
-                  status: "done",
-                  candidates,
-                  selectedCandidateIndex: 0,
-                  resultImageBase64: candidates[0]?.imageBase64 ?? null,
-                }),
-              }
-            : item,
-        ),
-      );
-      setError(null);
-    } catch (requestError) {
-      const message =
-        requestError instanceof Error ? requestError.message : "Unexpected error while replacing mapped subjects.";
-
-      setSourceItems((prev) =>
-        prev.map((item) =>
-          item.id === selectedSource.id
-            ? {
-                ...item,
-                sceneResult: createSceneResult({
-                  status: "failed",
-                  error: message,
-                }),
-              }
-            : item,
-        ),
-      );
-      setError(message);
     } finally {
       setIsReplacing(false);
-      setBatchProgress({ completed: 1, total: 1 });
+      setBatchProgress((prev) => (prev ? { ...prev, completed: prev.total } : null));
     }
   };
 
   const handleExecuteReplace = async () => {
+    if (replaceMode === "story-batch") {
+      if (storyPlan && storyPlan.scenes.length > 0) {
+        if (storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9") {
+          await executeStoryComicGenerate();
+        } else {
+          await executeStoryBatchGenerate();
+        }
+      } else {
+        await executeStoryPlanAnalysis();
+      }
+      return;
+    }
+
     if (replaceMode === "scene-mapping") {
       await executeSceneMappingReplace();
       return;
@@ -1520,6 +2894,11 @@ export default function HomePage() {
             storageWarning={storageWarning}
             isBusy={isReplacing}
             selectionEnabled={replaceMode === "global-targets"}
+            selectionDisabledMessage={
+              replaceMode === "story-batch"
+                ? "Story Batch is in role-assignment mode. Add or manage characters here, then assign them to the detected story roles inside the workbench after analysis."
+                : undefined
+            }
             onSelectionModeChange={handleSelectionModeChange}
             onToggleCharacterSelection={handleToggleCharacterSelection}
             onAddCharacter={handleAddCharacter}
@@ -1553,6 +2932,7 @@ export default function HomePage() {
             candidates={currentCandidates}
             selectedCandidateIndex={currentSelectedCandidateIndex}
             batchProgress={batchProgress}
+            mappedBatchReadyCount={mappedBatchReadyCount}
             onSourceImagesUpload={handleSourceImagesUpload}
             onSelectSource={handleSelectSource}
             onRemoveSource={handleRemoveSource}
@@ -1568,6 +2948,31 @@ export default function HomePage() {
             onSceneMappingLabelChange={handleSceneMappingLabelChange}
             onSceneMappingTargetCharacterChange={handleSceneMappingTargetCharacterChange}
             onSceneMappingNotesChange={handleSceneMappingNotesChange}
+            storyBatch={{
+              prompt: storyPrompt,
+              plan: storyPlan,
+              status: storyPlanStatus,
+              outputMode: storyOutputMode,
+              selectedSceneId: selectedStorySceneId,
+              selectedComicPageId: selectedStoryComicId,
+              storyRoleReadyCount,
+              onPromptChange: setStoryPrompt,
+              onAnalyze: executeStoryPlanAnalysis,
+              onGenerate:
+                storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9"
+                  ? executeStoryComicGenerate
+                  : executeStoryBatchGenerate,
+              onOutputModeChange: handleStoryOutputModeChange,
+              onSelectScene: handleSelectStoryScene,
+              onSelectComicPage: handleSelectStoryComic,
+              onPlanTitleChange: handleStoryPlanTitleChange,
+              onPlanSynopsisChange: handleStoryPlanSynopsisChange,
+              onPlanVisualStyleChange: handleStoryPlanVisualStyleChange,
+              onStoryRoleCharacterChange: handleStoryRoleCharacterChange,
+              onSceneTitleChange: handleStorySceneTitleChange,
+              onSceneNarrationChange: handleStorySceneNarrationChange,
+              onScenePromptChange: handleStoryScenePromptChange,
+            }}
             extraActionsLeft={
               <button
                 type="button"
@@ -1578,22 +2983,14 @@ export default function HomePage() {
                       replaceMode,
                       activeTargetCharacters.length,
                       `manga-replaced-${new Date().toISOString().slice(0, 10)}.zip`,
+                      storyPlan,
+                      storyOutputMode,
                     );
                   } catch (downloadError) {
                     setError(downloadError instanceof Error ? downloadError.message : "Failed to create ZIP file.");
                   }
                 }}
-                disabled={
-                  (replaceMode === "scene-mapping"
-                    ? sourceItems.every(
-                        (item) => item.sceneResult.status !== "done" || !item.sceneResult.resultImageBase64,
-                      )
-                    : sourceItems.every((item) =>
-                        Object.values(item.targetResults).every(
-                          (targetResult) => targetResult.status !== "done" || !targetResult.resultImageBase64,
-                        ),
-                      )) || isReplacing
-                }
+                disabled={!canDownloadZip}
                 className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
               >
                 <svg

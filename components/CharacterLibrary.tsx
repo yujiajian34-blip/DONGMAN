@@ -11,6 +11,7 @@ type CharacterLibraryProps = {
   storageWarning?: string | null;
   isBusy?: boolean;
   selectionEnabled?: boolean;
+  selectionDisabledMessage?: string;
   onSelectionModeChange: (mode: "single" | "multi") => void;
   onToggleCharacterSelection: (id: string) => void;
   onAddCharacter: (name: string, imageBase64: string) => Promise<void> | void;
@@ -42,6 +43,7 @@ export function CharacterLibrary({
   storageWarning,
   isBusy = false,
   selectionEnabled = true,
+  selectionDisabledMessage,
   onSelectionModeChange,
   onToggleCharacterSelection,
   onAddCharacter,
@@ -128,7 +130,8 @@ export function CharacterLibrary({
         </>
       ) : (
         <p className="mb-4 rounded-lg border border-zinc-800 bg-zinc-900/70 px-3 py-2 text-xs text-zinc-500">
-          Multi-subject mapping mode is active. Add or manage characters here, then assign each person inside the workbench.
+          {selectionDisabledMessage ??
+            "Multi-subject mapping mode is active. Add or manage characters here, then assign each person inside the workbench."}
         </p>
       )}
 
@@ -213,10 +216,10 @@ export function CharacterLibrary({
                   alt={character.name}
                   className="h-12 w-12 rounded-lg border border-zinc-700 object-cover"
                 />
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-medium text-zinc-100">{character.name}</p>
-                  <p className="text-xs text-zinc-500">{selectionHint}</p>
-                </div>
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-medium text-zinc-100">{character.name}</span>
+                  <span className="block text-xs text-zinc-500">{selectionHint}</span>
+                </span>
               </button>
 
               {selectionEnabled && isSelected ? (

@@ -1,12 +1,14 @@
 "use client";
 
-import { ChangeEvent, MouseEvent, useMemo, useRef, useState } from "react";
+import { ChangeEvent, MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Crop, Download, Loader2, Plus, Sparkles, Trash2, X } from "lucide-react";
 import type { Character } from "@/hooks/useCharacterStore";
 
-export type ReplaceMode = "global-targets" | "scene-mapping";
+export type ReplaceMode = "global-targets" | "scene-mapping" | "story-batch";
 export type ReplacementStatus = "pending" | "processing" | "done" | "failed" | "partial";
 export type TargetReplacementStatus = Exclude<ReplacementStatus, "partial">;
+export type StoryPlanStatus = "idle" | "processing" | "ready" | "failed";
+export type StoryOutputMode = "scene-frames" | "comic-grid-4" | "comic-grid-9";
 
 export type RoiRect = {
   x: number;
@@ -65,6 +67,74 @@ export type SceneMappingDraft = {
   notes: string;
 };
 
+export type StoryRoleDraft = {
+  id: string;
+  label: string;
+  description: string;
+  assignedCharacterId: string | null;
+  assignedCharacterName: string | null;
+  assignedCharacterImageBase64: string | null;
+  assignedCharacterAppearance: string | null;
+};
+
+export type StorySceneDraft = {
+  id: string;
+  title: string;
+  narration: string;
+  imagePrompt: string;
+  status: TargetReplacementStatus;
+  error: string | null;
+  candidates: WorkbenchCandidate[];
+  selectedCandidateIndex: number;
+  resultImageBase64: string | null;
+};
+
+export type StoryComicDraft = {
+  id: string;
+  title: string;
+  pageIndex: number;
+  panelCount: number;
+  sceneStartIndex: number;
+  sceneEndIndex: number;
+  status: TargetReplacementStatus;
+  error: string | null;
+  candidates: WorkbenchCandidate[];
+  selectedCandidateIndex: number;
+  resultImageBase64: string | null;
+};
+
+export type StoryPlanDraft = {
+  title: string;
+  synopsis: string;
+  visualStyle: string;
+  storyRoles: StoryRoleDraft[];
+  scenes: StorySceneDraft[];
+  comicPages: StoryComicDraft[];
+};
+
+type StoryBatchConfig = {
+  prompt: string;
+  plan: StoryPlanDraft | null;
+  status: StoryPlanStatus;
+  outputMode: StoryOutputMode;
+  selectedSceneId: string | null;
+  selectedComicPageId: string | null;
+  storyRoleReadyCount: number;
+  onPromptChange: (value: string) => void;
+  onAnalyze: () => void;
+  onGenerate: () => void;
+  onOutputModeChange: (mode: StoryOutputMode) => void;
+  onSelectScene: (id: string) => void;
+  onSelectComicPage: (id: string) => void;
+  onPlanTitleChange: (value: string) => void;
+  onPlanSynopsisChange: (value: string) => void;
+  onPlanVisualStyleChange: (value: string) => void;
+  onStoryRoleCharacterChange: (roleId: string, characterId: string | null) => void;
+  onSceneTitleChange: (id: string, value: string) => void;
+  onSceneNarrationChange: (id: string, value: string) => void;
+  onScenePromptChange: (id: string, value: string) => void;
+};
+
 type ReplacerWorkbenchProps = {
   replaceMode: ReplaceMode;
   onReplaceModeChange: (mode: ReplaceMode) => void;
@@ -90,6 +160,7 @@ type ReplacerWorkbenchProps = {
   candidates: WorkbenchCandidate[];
   selectedCandidateIndex: number;
   batchProgress: { completed: number; total: number } | null;
+  mappedBatchReadyCount: number;
   onSourceImagesUpload: (images: UploadedSourceImage[]) => void;
   onSelectSource: (id: string) => void;
   onRemoveSource: (id: string) => void;
@@ -105,6 +176,7 @@ type ReplacerWorkbenchProps = {
   onSceneMappingLabelChange: (id: string, value: string) => void;
   onSceneMappingTargetCharacterChange: (id: string, targetCharacterId: string | null) => void;
   onSceneMappingNotesChange: (id: string, value: string) => void;
+  storyBatch: StoryBatchConfig;
   extraActionsLeft?: React.ReactNode;
 };
 
@@ -138,13 +210,25 @@ function fileToBase64(file: File): Promise<string> {
 
 function makeDownloadName(name: string | null, replaceMode: ReplaceMode): string {
   if (!name) {
-    return replaceMode === "scene-mapping" ? "manga-scene-mapped.png" : "manga-replaced.png";
+    if (replaceMode === "scene-mapping") {
+      return "manga-scene-mapped.png";
+    }
+    if (replaceMode === "story-batch") {
+      return "story-scene.png";
+    }
+    return "manga-replaced.png";
   }
 
   const normalized = name.replace(/\.[a-zA-Z0-9]+$/, "").replace(/\s+/g, "-");
-  return replaceMode === "scene-mapping"
-    ? `${normalized || "manga-image"}-scene-mapped.png`
-    : `${normalized || "manga-image"}-replaced.png`;
+
+  if (replaceMode === "scene-mapping") {
+    return `${normalized || "manga-image"}-scene-mapped.png`;
+  }
+  if (replaceMode === "story-batch") {
+    return `${normalized || "story-scene"}-story-scene.png`;
+  }
+
+  return `${normalized || "manga-image"}-replaced.png`;
 }
 
 function statusLabel(status: ReplacementStatus): string {
@@ -179,10 +263,22 @@ function statusClassName(status: ReplacementStatus): string {
   return "border-zinc-700 bg-zinc-800/60 text-zinc-300";
 }
 
+function getComicPanelCount(storyOutputMode: StoryOutputMode): number {
+  return storyOutputMode === "comic-grid-4" ? 4 : 9;
+}
+
+function getComicModeLabel(storyOutputMode: StoryOutputMode): string {
+  return storyOutputMode === "comic-grid-4" ? "4-panel comic" : "9-panel comic";
+}
+
 function buildResultPlaceholder(
   replaceMode: ReplaceMode,
+  storyOutputMode: StoryOutputMode,
   activeTargetOption: TargetPreviewOption | null,
   sceneMappings: SceneMappingDraft[],
+  storyPlan: StoryPlanDraft | null,
+  selectedStoryScene: StorySceneDraft | null,
+  selectedStoryComic: StoryComicDraft | null,
 ): string {
   if (replaceMode === "global-targets") {
     if (activeTargetOption?.status === "processing") {
@@ -200,11 +296,73 @@ function buildResultPlaceholder(
     return "Generated result appears here.";
   }
 
-  if (sceneMappings.length === 0) {
-    return "Add one or more subject mappings, then draw each ROI on the source image.";
+  if (replaceMode === "scene-mapping") {
+    if (sceneMappings.length === 0) {
+      return "Add one or more subject mappings, then draw each ROI on the source image.";
+    }
+
+    return "Assign every subject to a target character and run mapped replace.";
   }
 
-  return "Assign every subject to a target character and run mapped replace.";
+  if (!storyPlan) {
+    return "Analyze the uploaded original images to extract the existing plot scene by scene.";
+  }
+
+  if (storyOutputMode === "comic-grid-4" || storyOutputMode === "comic-grid-9") {
+    const comicModeLabel = getComicModeLabel(storyOutputMode);
+
+    if (selectedStoryComic?.status === "processing") {
+      return "Generating...";
+    }
+
+    if (selectedStoryComic?.status === "failed") {
+      return `This ${comicModeLabel} page failed. Review the error above or retry.`;
+    }
+
+    if (!selectedStoryComic) {
+      return `Generate automatically paginated hand-drawn ${comicModeLabel} pages from the extracted scenes.`;
+    }
+
+    return `Preview ${selectedStoryComic.title}, covering scenes ${selectedStoryComic.sceneStartIndex + 1}-${selectedStoryComic.sceneEndIndex + 1} in order.`;
+  }
+
+  if (!selectedStoryScene) {
+    return "Select a scene from the storyboard to preview or render it.";
+  }
+
+  if (selectedStoryScene.status === "processing") {
+    return "Generating...";
+  }
+
+  if (selectedStoryScene.status === "failed") {
+    return "This story scene failed. Review the error above or retry.";
+  }
+
+  return "Render story scenes from the extracted plot using your assigned characters.";
+}
+
+function buildWorkbenchSummary(replaceMode: ReplaceMode): string {
+  if (replaceMode === "global-targets") {
+    return "Batch upload single-person source images, then replace each image with one or more selected target characters.";
+  }
+
+  if (replaceMode === "scene-mapping") {
+    return "Configure subject mappings per image, then batch replace every fully mapped image in the queue.";
+  }
+
+  return "Analyze uploaded original images, extract the existing plot without changing it, then render those scenes with your selected character library.";
+}
+
+function buildQueueHint(replaceMode: ReplaceMode): string {
+  if (replaceMode === "global-targets") {
+    return "Click an item to preview it and edit its prompt";
+  }
+
+  if (replaceMode === "scene-mapping") {
+    return "Click an item to configure subject mappings";
+  }
+
+  return "Upload the original story images in order so the existing plot can be extracted faithfully";
 }
 
 export function ReplacerWorkbench({
@@ -232,6 +390,7 @@ export function ReplacerWorkbench({
   candidates,
   selectedCandidateIndex,
   batchProgress,
+  mappedBatchReadyCount,
   onSourceImagesUpload,
   onSelectSource,
   onRemoveSource,
@@ -247,6 +406,7 @@ export function ReplacerWorkbench({
   onSceneMappingLabelChange,
   onSceneMappingTargetCharacterChange,
   onSceneMappingNotesChange,
+  storyBatch,
   extraActionsLeft,
 }: ReplacerWorkbenchProps) {
   const sourceStageRef = useRef<HTMLDivElement | null>(null);
@@ -268,6 +428,25 @@ export function ReplacerWorkbench({
     return targetOptions.find((target) => target.id === activeTargetCharacterId) ?? targetOptions[0] ?? null;
   }, [activeTargetCharacterId, targetOptions]);
 
+  const selectedStoryScene = useMemo(() => {
+    if (!storyBatch.plan || storyBatch.plan.scenes.length === 0) {
+      return null;
+    }
+
+    return storyBatch.plan.scenes.find((scene) => scene.id === storyBatch.selectedSceneId) ?? storyBatch.plan.scenes[0];
+  }, [storyBatch.plan, storyBatch.selectedSceneId]);
+
+  const selectedStoryComic = useMemo(() => {
+    if (!storyBatch.plan || storyBatch.plan.comicPages.length === 0) {
+      return null;
+    }
+
+    return (
+      storyBatch.plan.comicPages.find((comicPage) => comicPage.id === storyBatch.selectedComicPageId) ??
+      storyBatch.plan.comicPages[0]
+    );
+  }, [storyBatch.plan, storyBatch.selectedComicPageId]);
+
   const globalTargetLabel = useMemo(() => {
     if (globalSelectedCharacters.length === 0) {
       return null;
@@ -284,25 +463,55 @@ export function ReplacerWorkbench({
     return `${preview} +${globalSelectedCharacters.length - 3} more`;
   }, [globalSelectedCharacters]);
 
+  const storyRoleSummaryLabel = useMemo(() => {
+    if (!storyBatch.plan || storyBatch.plan.storyRoles.length === 0) {
+      return null;
+    }
+
+    return `${storyBatch.storyRoleReadyCount}/${storyBatch.plan.storyRoles.length} roles assigned`;
+  }, [storyBatch.plan, storyBatch.storyRoleReadyCount]);
+
   const configuredSceneMappings = useMemo(
     () => sceneMappings.filter((mapping) => Boolean(mapping.roi) && Boolean(mapping.targetCharacterId)).length,
     [sceneMappings],
   );
 
+  const storySceneCount = storyBatch.plan?.scenes.length ?? 0;
+  const plannedComicPageCount = storyBatch.plan?.comicPages.length ?? 0;
+  const storyHasPlan = Boolean(storyBatch.plan && storyBatch.plan.scenes.length > 0);
+  const canRenderComicGrid =
+    (storyBatch.outputMode === "comic-grid-4" || storyBatch.outputMode === "comic-grid-9") && plannedComicPageCount > 0;
   const plannedReplaceCount =
     replaceMode === "global-targets"
       ? sourceItems.length * Math.max(globalSelectedCharacters.length, 1)
-      : selectedItem
-        ? 1
-        : 0;
+      : replaceMode === "scene-mapping"
+        ? mappedBatchReadyCount
+        : storyHasPlan
+          ? storyBatch.outputMode === "comic-grid-4" || storyBatch.outputMode === "comic-grid-9"
+            ? plannedComicPageCount
+            : storySceneCount
+          : sourceItems.length;
   const canRun =
     replaceMode === "global-targets"
       ? sourceItems.length > 0 && globalSelectedCharacters.length > 0 && !isReplacing
-      : Boolean(selectedItem) && !isReplacing;
+      : replaceMode === "scene-mapping"
+        ? mappedBatchReadyCount > 0 && !isReplacing
+        : sourceItems.length > 0 &&
+          !isReplacing &&
+          ((storyBatch.outputMode !== "comic-grid-4" && storyBatch.outputMode !== "comic-grid-9") ||
+            !storyHasPlan ||
+            canRenderComicGrid);
+  const canDrawRoi = Boolean(sourceImageBase64) && replaceMode === "scene-mapping" && Boolean(activeSceneMappingId);
 
-  const canDrawRoi =
-    Boolean(sourceImageBase64) &&
-    (replaceMode === "global-targets" || Boolean(activeSceneMappingId));
+  useEffect(() => {
+    if (canDrawRoi) {
+      return;
+    }
+
+    setIsDrawingRoi(false);
+    setRoiStart(null);
+    setDraftRoi(null);
+  }, [canDrawRoi]);
 
   const handleSourceUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []);
@@ -416,7 +625,57 @@ export function ReplacerWorkbench({
     ];
   }, [activeRoiLabel, draftRoi, isDrawingRoi, roiOverlays]);
 
-  const resultPlaceholder = buildResultPlaceholder(replaceMode, activeTargetOption, sceneMappings);
+  const resultPlaceholder = buildResultPlaceholder(
+    replaceMode,
+    storyBatch.outputMode,
+    activeTargetOption,
+    sceneMappings,
+    storyBatch.plan,
+    selectedStoryScene,
+    selectedStoryComic,
+  );
+
+  const primaryActionLabel = useMemo(() => {
+    if (isReplacing) {
+      return `Processing ${batchProgress?.completed ?? 0}/${batchProgress?.total ?? plannedReplaceCount}`;
+    }
+
+    if (replaceMode === "global-targets") {
+      return globalSelectedCharacters.length > 1
+        ? `Execute Single Subject Batch (${sourceItems.length} x ${globalSelectedCharacters.length})`
+        : `Execute Single Subject Batch (${sourceItems.length})`;
+    }
+
+    if (replaceMode === "scene-mapping") {
+      return mappedBatchReadyCount > 1 ? `Execute Mapped Batch (${mappedBatchReadyCount})` : "Execute Mapped Replace";
+    }
+
+    if (storyHasPlan) {
+      if (storyBatch.outputMode === "comic-grid-4") {
+        return plannedComicPageCount > 1 ? `Generate 4-Panel Pages (${plannedComicPageCount})` : "Generate 4-Panel Page";
+      }
+
+      if (storyBatch.outputMode === "comic-grid-9") {
+        return plannedComicPageCount > 1 ? `Generate 9-Panel Pages (${plannedComicPageCount})` : "Generate 9-Panel Page";
+      }
+
+      return storySceneCount > 1 ? `Generate Story Batch (${storySceneCount})` : "Generate Story Image";
+    }
+
+    return `Analyze Existing Plot (${sourceItems.length})`;
+  }, [
+    batchProgress,
+    globalSelectedCharacters.length,
+    isReplacing,
+    mappedBatchReadyCount,
+    plannedReplaceCount,
+    replaceMode,
+    sourceItems.length,
+    storyBatch.outputMode,
+    storyHasPlan,
+    plannedComicPageCount,
+    storySceneCount,
+  ]);
 
   return (
     <section className="h-full rounded-2xl border border-zinc-800/90 bg-zinc-950/70 p-4 shadow-2xl shadow-black/40 backdrop-blur">
@@ -424,9 +683,7 @@ export function ReplacerWorkbench({
         <div>
           <h2 className="text-sm font-semibold uppercase tracking-[0.18em] text-zinc-300">Replacement Workbench</h2>
           <p className="mt-1 text-xs text-zinc-500">
-            {replaceMode === "global-targets"
-              ? "Batch upload source images, then replace each image with one or more target characters."
-              : "Map each person in the current image to a different target character and replace them in one pass."}
+            {buildWorkbenchSummary(replaceMode)}
             {isReplacing ? " Gateway processing can take 30-70s per request." : ""}
           </p>
         </div>
@@ -440,13 +697,7 @@ export function ReplacerWorkbench({
           className="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-zinc-950 transition disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400 hover:enabled:bg-emerald-400"
         >
           {isReplacing ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
-          {isReplacing
-            ? `Replacing ${batchProgress?.completed ?? 0}/${batchProgress?.total ?? plannedReplaceCount}`
-            : replaceMode === "global-targets"
-              ? globalSelectedCharacters.length > 1
-                ? `Execute Multi Replace (${sourceItems.length} x ${globalSelectedCharacters.length})`
-                : `Execute Batch Replace (${sourceItems.length})`
-              : "Execute Mapped Replace"}
+          {primaryActionLabel}
         </button>
       </div>
 
@@ -461,7 +712,7 @@ export function ReplacerWorkbench({
               : "text-zinc-300 hover:bg-zinc-800"
           } disabled:cursor-not-allowed disabled:opacity-60`}
         >
-          Global Targets
+          Single Subject Batch
         </button>
         <button
           type="button"
@@ -474,6 +725,16 @@ export function ReplacerWorkbench({
           } disabled:cursor-not-allowed disabled:opacity-60`}
         >
           Mapped Subjects
+        </button>
+        <button
+          type="button"
+          onClick={() => onReplaceModeChange("story-batch")}
+          disabled={isReplacing}
+          className={`flex-1 rounded-md px-3 py-2 text-xs font-medium transition ${
+            replaceMode === "story-batch" ? "bg-emerald-500 text-zinc-950" : "text-zinc-300 hover:bg-zinc-800"
+          } disabled:cursor-not-allowed disabled:opacity-60`}
+        >
+          Story Batch
         </button>
       </div>
 
@@ -492,9 +753,7 @@ export function ReplacerWorkbench({
       <div className="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/70 p-2">
         <div className="mb-2 flex items-center justify-between">
           <p className="text-[11px] uppercase tracking-[0.12em] text-zinc-400">Source Queue ({sourceItems.length})</p>
-          <p className="text-[11px] text-zinc-500">
-            {replaceMode === "global-targets" ? "Click an item to preview and edit ROI" : "Click an item to configure subject mappings"}
-          </p>
+          <p className="text-[11px] text-zinc-500">{buildQueueHint(replaceMode)}</p>
         </div>
         <div className="max-h-28 space-y-1 overflow-y-auto pr-1">
           {sourceItems.length === 0 ? (
@@ -525,19 +784,17 @@ export function ReplacerWorkbench({
                     alt={item.name}
                     className="h-8 w-8 rounded border border-zinc-700 object-cover"
                   />
-                  <div className="min-w-0">
+                  <span className="min-w-0">
                     <span className="block truncate text-xs text-zinc-200">{item.name}</span>
-                    {item.detailText ? (
-                      <span className="block text-[10px] text-zinc-500">{item.detailText}</span>
-                    ) : null}
-                  </div>
+                    {item.detailText ? <span className="block text-[10px] text-zinc-500">{item.detailText}</span> : null}
+                  </span>
                 </button>
 
                 <span className={`rounded px-1.5 py-0.5 text-[10px] ${statusClassName(item.status)}`}>
                   {statusLabel(item.status)}
                 </span>
 
-                {item.extraPrompt.trim() ? (
+                {item.extraPrompt.trim() && replaceMode !== "story-batch" ? (
                   <span className="rounded border border-blue-500/40 bg-blue-500/10 px-1.5 py-0.5 text-[10px] text-blue-200">
                     Prompt
                   </span>
@@ -562,7 +819,7 @@ export function ReplacerWorkbench({
         {replaceMode === "global-targets" ? (
           globalSelectedCharacters.length > 0 ? (
             <div className="rounded-lg border border-zinc-800 bg-zinc-900/80 px-2 py-1 text-xs text-zinc-400">
-              {globalSelectedCharacters.length === 1 ? "Current reference: " : "Current targets: "}
+              {globalSelectedCharacters.length === 1 ? "Selected reference: " : "Selected targets: "}
               <span className="font-medium text-zinc-100">{globalTargetLabel}</span>
             </div>
           ) : (
@@ -570,20 +827,45 @@ export function ReplacerWorkbench({
               Pick at least one target character from the library.
             </div>
           )
-        ) : (
+        ) : replaceMode === "scene-mapping" ? (
           <div className="rounded-lg border border-zinc-800 bg-zinc-900/80 px-2 py-1 text-xs text-zinc-400">
-            Subject mappings ready: <span className="font-medium text-zinc-100">{configuredSceneMappings}/{sceneMappings.length}</span>
+            Subject mappings ready:{" "}
+            <span className="font-medium text-zinc-100">
+              {configuredSceneMappings}/{sceneMappings.length}
+            </span>
+          </div>
+        ) : storyBatch.plan ? (
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/80 px-2 py-1 text-xs text-zinc-400">
+            Story roles: <span className="font-medium text-zinc-100">{storyRoleSummaryLabel}</span>
+          </div>
+        ) : (
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/80 px-2 py-1 text-xs text-zinc-500">
+            Analyze the uploaded original images first, then assign your own characters to the detected story roles.
           </div>
         )}
 
-        <div className="rounded-lg border border-zinc-800 bg-zinc-900/80 px-2 py-1 text-xs text-zinc-400">
-          <span className="inline-flex items-center gap-1">
-            <Crop size={12} />
-            {replaceMode === "global-targets" ? "Drag on source to mark target ROI" : "Select a subject slot, then drag on source to mark that person"}
-          </span>
-        </div>
+        {replaceMode === "global-targets" ? (
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/80 px-2 py-1 text-xs text-zinc-400">
+            Single Subject Batch assumes each source image contains one main person. No ROI is needed.
+          </div>
+        ) : replaceMode === "scene-mapping" ? (
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/80 px-2 py-1 text-xs text-zinc-400">
+            <span className="inline-flex items-center gap-1">
+              <Crop size={12} />
+              Select a subject slot, then drag on source to mark that person
+            </span>
+          </div>
+        ) : (
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/80 px-2 py-1 text-xs text-zinc-400">
+            {storyHasPlan
+              ? storyBatch.outputMode === "comic-grid-4" || storyBatch.outputMode === "comic-grid-9"
+                ? `${plannedComicPageCount} comic page${plannedComicPageCount === 1 ? "" : "s"} planned from ${storySceneCount} extracted scene${storySceneCount === 1 ? "" : "s"}`
+                : `Storyboard ready: ${storySceneCount} scene${storySceneCount === 1 ? "" : "s"}`
+              : "Upload references, then analyze them into a storyboard draft."}
+          </div>
+        )}
 
-        {activeRoi ? (
+        {replaceMode === "scene-mapping" && activeRoi ? (
           <button
             type="button"
             onClick={onClearActiveRoi}
@@ -597,20 +879,31 @@ export function ReplacerWorkbench({
 
       <div className="mb-3 space-y-2 rounded-xl border border-zinc-800 bg-zinc-900/70 p-3">
         <div className="flex items-center justify-between">
-          <p className="text-xs font-semibold uppercase tracking-[0.12em] text-zinc-300">Prompt For Selected Source</p>
-          <p className="text-[11px] text-zinc-500">{selectedSourcePrompt.length}/600</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.12em] text-zinc-300">
+            {replaceMode === "story-batch" ? "Story Direction" : "Prompt For Selected Source"}
+          </p>
+          <p className="text-[11px] text-zinc-500">
+            {replaceMode === "story-batch" ? storyBatch.prompt.length : selectedSourcePrompt.length}/
+            {replaceMode === "story-batch" ? 1200 : 600}
+          </p>
         </div>
         <textarea
-          value={selectedSourcePrompt}
-          onChange={(event) => onSelectedSourcePromptChange(event.target.value.slice(0, 600))}
-          disabled={!selectedItem || isReplacing}
+          value={replaceMode === "story-batch" ? storyBatch.prompt : selectedSourcePrompt}
+          onChange={(event) =>
+            replaceMode === "story-batch"
+              ? storyBatch.onPromptChange(event.target.value.slice(0, 1200))
+              : onSelectedSourcePromptChange(event.target.value.slice(0, 600))
+          }
+          disabled={replaceMode === "story-batch" ? isReplacing : !selectedItem || isReplacing}
           rows={3}
           placeholder={
-            selectedItem
-              ? replaceMode === "global-targets"
-                ? "Example: Keep short orange hair, tired narrow eyes, masculine jawline, plain gray shirt."
-                : "Example: Keep left person in school uniform, right person smiling, preserve the table and cups."
-              : "Select one source image first."
+            replaceMode === "story-batch"
+              ? "Example: Turn these references into a quiet romance short story with rain, misunderstandings, and a rooftop confession. Keep a clean manga frame style."
+              : selectedItem
+                ? replaceMode === "global-targets"
+                  ? "Example: Keep short orange hair, tired narrow eyes, masculine jawline, plain gray shirt."
+                  : "Example: Keep left person in school uniform, right person smiling, preserve the table and cups."
+                : "Select one source image first."
           }
           className="w-full resize-y rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
         />
@@ -653,9 +946,7 @@ export function ReplacerWorkbench({
                   <div
                     key={mapping.id}
                     className={`rounded-xl border p-3 transition ${
-                      isActive
-                        ? "border-emerald-500/70 bg-emerald-500/10"
-                        : "border-zinc-800 bg-zinc-900/70"
+                      isActive ? "border-emerald-500/70 bg-emerald-500/10" : "border-zinc-800 bg-zinc-900/70"
                     }`}
                   >
                     <div className="flex flex-wrap items-center gap-2">
@@ -682,9 +973,7 @@ export function ReplacerWorkbench({
 
                       <select
                         value={mapping.targetCharacterId ?? ""}
-                        onChange={(event) =>
-                          onSceneMappingTargetCharacterChange(mapping.id, event.target.value || null)
-                        }
+                        onChange={(event) => onSceneMappingTargetCharacterChange(mapping.id, event.target.value || null)}
                         disabled={isReplacing}
                         className="min-w-[10rem] rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
                       >
@@ -708,10 +997,22 @@ export function ReplacerWorkbench({
                     </div>
 
                     <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-zinc-400">
-                      <span className={`rounded-full border px-2 py-0.5 ${mapping.roi ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200" : "border-zinc-700 bg-zinc-900 text-zinc-400"}`}>
+                      <span
+                        className={`rounded-full border px-2 py-0.5 ${
+                          mapping.roi
+                            ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+                            : "border-zinc-700 bg-zinc-900 text-zinc-400"
+                        }`}
+                      >
                         {mapping.roi ? "ROI set" : "ROI missing"}
                       </span>
-                      <span className={`rounded-full border px-2 py-0.5 ${mapping.targetCharacterId ? "border-sky-500/40 bg-sky-500/10 text-sky-200" : "border-zinc-700 bg-zinc-900 text-zinc-400"}`}>
+                      <span
+                        className={`rounded-full border px-2 py-0.5 ${
+                          mapping.targetCharacterId
+                            ? "border-sky-500/40 bg-sky-500/10 text-sky-200"
+                            : "border-zinc-700 bg-zinc-900 text-zinc-400"
+                        }`}
+                      >
                         {mapping.targetCharacterName ?? "Target missing"}
                       </span>
                     </div>
@@ -746,6 +1047,306 @@ export function ReplacerWorkbench({
         </div>
       ) : null}
 
+      {replaceMode === "story-batch" ? (
+        <div className="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/70 p-3">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-zinc-300">Story Plan</p>
+              <p className="mt-1 text-[11px] text-zinc-500">
+                Analyze your uploaded original images in order, extract the existing plot exactly as shown, then render those same scenes with your assigned characters.
+              </p>
+              <div className="mt-2 inline-flex rounded-lg border border-zinc-800 bg-zinc-950/80 p-1">
+                <button
+                  type="button"
+                  onClick={() => storyBatch.onOutputModeChange("scene-frames")}
+                  disabled={isReplacing}
+                  className={`rounded-md px-3 py-1.5 text-[11px] font-medium transition ${
+                    storyBatch.outputMode === "scene-frames"
+                      ? "bg-emerald-500 text-zinc-950"
+                      : "text-zinc-300 hover:bg-zinc-800"
+                  } disabled:cursor-not-allowed disabled:opacity-60`}
+                >
+                  Scene Frames
+                </button>
+                <button
+                  type="button"
+                  onClick={() => storyBatch.onOutputModeChange("comic-grid-4")}
+                  disabled={isReplacing}
+                  className={`rounded-md px-3 py-1.5 text-[11px] font-medium transition ${
+                    storyBatch.outputMode === "comic-grid-4"
+                      ? "bg-emerald-500 text-zinc-950"
+                      : "text-zinc-300 hover:bg-zinc-800"
+                  } disabled:cursor-not-allowed disabled:opacity-60`}
+                >
+                  4-Panel Comic
+                </button>
+                <button
+                  type="button"
+                  onClick={() => storyBatch.onOutputModeChange("comic-grid-9")}
+                  disabled={isReplacing}
+                  className={`rounded-md px-3 py-1.5 text-[11px] font-medium transition ${
+                    storyBatch.outputMode === "comic-grid-9"
+                      ? "bg-emerald-500 text-zinc-950"
+                      : "text-zinc-300 hover:bg-zinc-800"
+                  } disabled:cursor-not-allowed disabled:opacity-60`}
+                >
+                  9-Panel Comic
+                </button>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={storyBatch.onAnalyze}
+                disabled={sourceItems.length === 0 || isReplacing}
+                className="inline-flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-medium text-zinc-200 transition hover:border-emerald-500 hover:text-emerald-300 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {storyBatch.status === "processing" && !storyHasPlan ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+                {storyHasPlan ? "Reanalyze Original Plot" : "Analyze Original Plot"}
+              </button>
+              <button
+                type="button"
+                onClick={storyBatch.onGenerate}
+                disabled={
+                  !storyHasPlan ||
+                  isReplacing ||
+                  ((storyBatch.outputMode === "comic-grid-4" || storyBatch.outputMode === "comic-grid-9") &&
+                    !canRenderComicGrid)
+                }
+                className="inline-flex items-center gap-1 rounded-lg bg-emerald-500 px-3 py-2 text-xs font-semibold text-zinc-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400"
+              >
+                {isReplacing && storyHasPlan ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+                {storyBatch.outputMode === "comic-grid-4"
+                  ? "Render 4-Panel Pages"
+                  : storyBatch.outputMode === "comic-grid-9"
+                    ? "Render 9-Panel Pages"
+                    : "Render Scenes"}
+              </button>
+            </div>
+          </div>
+
+          {sourceItems.length === 0 ? (
+            <p className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-3 text-xs text-zinc-500">
+              Upload at least one original story image to analyze the existing plot.
+            </p>
+          ) : !storyBatch.plan ? (
+            <p className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-3 text-xs text-zinc-500">
+              Analyze the uploaded original images to extract the existing title, synopsis, story roles, and one faithful scene prompt per image.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              {storyBatch.outputMode === "comic-grid-4" || storyBatch.outputMode === "comic-grid-9" ? (
+                <div className="rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-100">
+                  Auto-pagination mode. The app keeps the extracted scene order and splits all scenes into balanced{" "}
+                  {storyBatch.outputMode === "comic-grid-4" ? "up-to-4-panel" : "up-to-9-panel"} comic pages.
+                  {canRenderComicGrid
+                    ? " Short final pages can use fewer panels when that keeps pacing cleaner."
+                    : " Analyze at least one original story image to enable this mode."}
+                </div>
+              ) : null}
+
+              <div className="grid gap-3 lg:grid-cols-2">
+                <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+                  <div className="text-[11px] uppercase tracking-[0.12em] text-zinc-500">Story Title</div>
+                  <input
+                    type="text"
+                    value={storyBatch.plan.title}
+                    onChange={(event) => storyBatch.onPlanTitleChange(event.target.value.slice(0, 100))}
+                    disabled={isReplacing}
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                </div>
+                <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+                  <div className="text-[11px] uppercase tracking-[0.12em] text-zinc-500">Visual Style</div>
+                  <textarea
+                    value={storyBatch.plan.visualStyle}
+                    onChange={(event) => storyBatch.onPlanVisualStyleChange(event.target.value.slice(0, 260))}
+                    disabled={isReplacing}
+                    rows={3}
+                    className="w-full resize-y rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+                <div className="text-[11px] uppercase tracking-[0.12em] text-zinc-500">Synopsis</div>
+                <textarea
+                  value={storyBatch.plan.synopsis}
+                  onChange={(event) => storyBatch.onPlanSynopsisChange(event.target.value.slice(0, 500))}
+                  disabled={isReplacing}
+                  rows={3}
+                  className="w-full resize-y rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
+                />
+              </div>
+
+              <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+                <div className="text-[11px] uppercase tracking-[0.12em] text-zinc-500">Story Roles</div>
+                <div className="grid gap-2 md:grid-cols-2">
+                  {storyBatch.plan.storyRoles.map((role) => (
+                    <div key={role.id} className="rounded-lg border border-zinc-800 bg-zinc-900/80 p-3">
+                      <div className="text-xs font-medium text-zinc-100">{role.label}</div>
+                      <div className="mt-1 text-[11px] text-zinc-400">{role.description}</div>
+                      <select
+                        value={role.assignedCharacterId ?? ""}
+                        onChange={(event) => storyBatch.onStoryRoleCharacterChange(role.id, event.target.value || null)}
+                        disabled={isReplacing}
+                        className="mt-2 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <option value="">Assign character</option>
+                        {availableCharacters.map((character) => (
+                          <option key={character.id} value={character.id}>
+                            {character.name}
+                          </option>
+                        ))}
+                      </select>
+                      {role.assignedCharacterImageBase64 ? (
+                        <div className="mt-2 flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/60 px-2 py-2">
+                          <img
+                            src={role.assignedCharacterImageBase64}
+                            alt={role.assignedCharacterName ?? "Assigned character"}
+                            className="h-9 w-9 rounded border border-zinc-700 object-cover"
+                          />
+                          <span className="min-w-0 text-xs text-zinc-300">
+                            <span className="block truncate font-medium text-zinc-100">
+                              {role.assignedCharacterName}
+                            </span>
+                            <span className="block text-[11px] text-zinc-500">Used for this story role</span>
+                          </span>
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {(storyBatch.outputMode === "comic-grid-4" || storyBatch.outputMode === "comic-grid-9") &&
+              storyBatch.plan.comicPages.length > 0 ? (
+                <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+                  <div className="text-[11px] uppercase tracking-[0.12em] text-zinc-500">Comic Pages</div>
+                  <div className="grid gap-2 md:grid-cols-2">
+                    {storyBatch.plan.comicPages.map((comicPage) => {
+                      const isSelected = selectedStoryComic?.id === comicPage.id;
+                      return (
+                        <button
+                          key={comicPage.id}
+                          type="button"
+                          onClick={() => storyBatch.onSelectComicPage(comicPage.id)}
+                          disabled={isReplacing}
+                          className={`rounded-lg border p-3 text-left transition ${
+                            isSelected
+                              ? "border-emerald-500/70 bg-emerald-500/10"
+                              : "border-zinc-800 bg-zinc-900/80 hover:border-zinc-700"
+                          } disabled:cursor-not-allowed disabled:opacity-60`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div>
+                              <div className="text-xs font-medium text-zinc-100">{comicPage.title}</div>
+                              <div className="mt-1 text-[11px] text-zinc-400">
+                                Scenes {comicPage.sceneStartIndex + 1}-{comicPage.sceneEndIndex + 1} / {comicPage.panelCount} panel
+                                {comicPage.panelCount === 1 ? "" : "s"}
+                              </div>
+                            </div>
+                            <span className={`rounded px-1.5 py-0.5 text-[10px] ${statusClassName(comicPage.status)}`}>
+                              {statusLabel(comicPage.status)}
+                            </span>
+                          </div>
+                          {comicPage.resultImageBase64 ? (
+                            <img
+                              src={comicPage.resultImageBase64}
+                              alt={comicPage.title}
+                              className="mt-2 h-14 w-full rounded border border-zinc-700 object-cover"
+                            />
+                          ) : null}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="space-y-2">
+                {(storyBatch.outputMode === "comic-grid-4" || storyBatch.outputMode === "comic-grid-9") &&
+                storyBatch.plan.comicPages.length > 1 ? (
+                  <div className="rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-[11px] text-zinc-400">
+                    Scenes stay in the original order and are automatically balanced across {storyBatch.plan.comicPages.length} comic
+                    {" "}page{storyBatch.plan.comicPages.length === 1 ? "" : "s"}.
+                  </div>
+                ) : null}
+                {storyBatch.plan.scenes.map((scene, index) => {
+                  const isSelected = selectedStoryScene?.id === scene.id;
+
+                  return (
+                    <div
+                      key={scene.id}
+                      className={`rounded-xl border p-3 transition ${
+                        isSelected ? "border-emerald-500/70 bg-emerald-500/10" : "border-zinc-800 bg-zinc-900/70"
+                      }`}
+                    >
+                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => storyBatch.onSelectScene(scene.id)}
+                            className={`rounded-md px-2 py-1 text-[11px] font-medium transition ${
+                              isSelected
+                                ? "bg-emerald-500 text-zinc-950"
+                                : "border border-zinc-700 bg-zinc-900 text-zinc-200 hover:border-zinc-500"
+                            }`}
+                          >
+                            {isSelected ? "Previewing" : "Preview Scene"}
+                          </button>
+                          <span className="text-[11px] text-zinc-500">Scene {index + 1}</span>
+                          <span className={`rounded px-1.5 py-0.5 text-[10px] ${statusClassName(scene.status)}`}>
+                            {statusLabel(scene.status)}
+                          </span>
+                        </div>
+                        {scene.resultImageBase64 ? (
+                          <img
+                            src={scene.resultImageBase64}
+                            alt={scene.title}
+                            className="h-10 w-10 rounded border border-zinc-700 object-cover"
+                          />
+                        ) : null}
+                      </div>
+
+                      <div className="grid gap-2 lg:grid-cols-2">
+                        <input
+                          type="text"
+                          value={scene.title}
+                          onChange={(event) => storyBatch.onSceneTitleChange(scene.id, event.target.value.slice(0, 100))}
+                          disabled={isReplacing}
+                          placeholder="Scene title"
+                          className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
+                        />
+                        <textarea
+                          value={scene.narration}
+                          onChange={(event) =>
+                            storyBatch.onSceneNarrationChange(scene.id, event.target.value.slice(0, 300))
+                          }
+                          disabled={isReplacing}
+                          rows={2}
+                          placeholder="Story beat"
+                          className="w-full resize-y rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
+                        />
+                      </div>
+
+                      <textarea
+                        value={scene.imagePrompt}
+                        onChange={(event) => storyBatch.onScenePromptChange(scene.id, event.target.value.slice(0, 1200))}
+                        disabled={isReplacing}
+                        rows={4}
+                        placeholder="Scene image prompt"
+                        className="mt-2 w-full resize-y rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 outline-none ring-emerald-500 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      ) : null}
+
       {replaceMode === "global-targets" && selectedItem && targetOptions.length > 1 ? (
         <div className="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/70 p-3">
           <div className="mb-2 flex items-center justify-between">
@@ -762,9 +1363,7 @@ export function ReplacerWorkbench({
                   type="button"
                   onClick={() => onActiveTargetCharacterChange(target.id)}
                   className={`flex min-w-[9rem] items-center gap-2 rounded-lg border px-2 py-2 text-left transition ${
-                    isActive
-                      ? "border-emerald-500 bg-emerald-500/10"
-                      : "border-zinc-700 bg-zinc-900 hover:border-zinc-500"
+                    isActive ? "border-emerald-500 bg-emerald-500/10" : "border-zinc-700 bg-zinc-900 hover:border-zinc-500"
                   }`}
                 >
                   <img
@@ -772,12 +1371,12 @@ export function ReplacerWorkbench({
                     alt={target.name}
                     className="h-9 w-9 rounded border border-zinc-700 object-cover"
                   />
-                  <div className="min-w-0">
-                    <div className="truncate text-xs font-medium text-zinc-100">{target.name}</div>
-                    <div className={`mt-1 inline-flex rounded px-1.5 py-0.5 text-[10px] ${statusClassName(target.status)}`}>
+                  <span className="min-w-0">
+                    <span className="block truncate text-xs font-medium text-zinc-100">{target.name}</span>
+                    <span className={`mt-1 inline-flex rounded px-1.5 py-0.5 text-[10px] ${statusClassName(target.status)}`}>
                       {statusLabel(target.status)}
-                    </div>
-                  </div>
+                    </span>
+                  </span>
                 </button>
               );
             })}
@@ -812,9 +1411,7 @@ export function ReplacerWorkbench({
                   <div
                     key={overlay.id}
                     className={`pointer-events-none absolute border-2 ${
-                      overlay.isActive
-                        ? "border-emerald-400 bg-emerald-400/15"
-                        : "border-sky-400/80 bg-sky-400/10"
+                      overlay.isActive ? "border-emerald-400 bg-emerald-400/15" : "border-sky-400/80 bg-sky-400/10"
                     }`}
                     style={{
                       left: `${overlay.roi.x * 100}%`,
@@ -837,9 +1434,18 @@ export function ReplacerWorkbench({
                     Select a subject slot first, then drag on the image to mark that person&apos;s ROI.
                   </div>
                 ) : null}
+                {replaceMode === "story-batch" ? (
+                  <div className="pointer-events-none absolute inset-x-4 bottom-4 rounded-lg border border-zinc-700/80 bg-zinc-950/80 px-3 py-2 text-xs text-zinc-300">
+                    This original image is used to extract the exact existing scene, pacing, and framing without changing the plot.
+                  </div>
+                ) : null}
               </div>
             ) : (
-              <p className="text-xs text-zinc-500">Select one source image from the queue to preview.</p>
+              <p className="text-xs text-zinc-500">
+                {replaceMode === "story-batch"
+                  ? "Select one uploaded reference image from the queue to preview it."
+                  : "Select one source image from the queue to preview."}
+              </p>
             )}
           </div>
         </div>
@@ -853,7 +1459,14 @@ export function ReplacerWorkbench({
             {resultImageBase64 ? (
               <a
                 href={resultImageBase64}
-                download={makeDownloadName(selectedSourceName, replaceMode)}
+                download={makeDownloadName(
+                  replaceMode === "story-batch"
+                    ? storyBatch.outputMode === "comic-grid-4" || storyBatch.outputMode === "comic-grid-9"
+                      ? selectedStoryComic?.title ?? null
+                      : selectedStoryScene?.title ?? null
+                    : selectedSourceName,
+                  replaceMode,
+                )}
                 className="inline-flex items-center gap-1 rounded-md border border-zinc-700 px-2 py-1 text-[11px] font-semibold normal-case tracking-normal text-zinc-200 transition hover:border-emerald-500 hover:text-emerald-300"
               >
                 <Download size={12} />
@@ -880,9 +1493,7 @@ export function ReplacerWorkbench({
                       key={`${candidate.imageBase64.slice(0, 32)}-${index}`}
                       onClick={() => onSelectCandidate(index)}
                       className={`rounded-lg border p-1 text-left transition ${
-                        isSelected
-                          ? "border-emerald-500 bg-emerald-500/10"
-                          : "border-zinc-700 bg-zinc-900 hover:border-zinc-500"
+                        isSelected ? "border-emerald-500 bg-emerald-500/10" : "border-zinc-700 bg-zinc-900 hover:border-zinc-500"
                       }`}
                     >
                       <img src={candidate.imageBase64} alt={`Candidate ${index + 1}`} className="h-16 w-full rounded object-cover" />

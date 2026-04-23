@@ -220,6 +220,10 @@ function normalizeImageBase64(rawBase64: string): NormalizedImage {
       const isImageMime = mimeType.startsWith("image/");
       const isBase64DataUrl = headerLower.includes(";base64");
 
+      if (mimeType.toLowerCase() === "image/svg+xml") {
+        throw new RequestValidationError("SVG images are not supported by the gateway. Please upload PNG, JPG, or WEBP images.");
+      }
+
       if (isImageMime && isBase64DataUrl) {
         return {
           mimeType,
